@@ -1,0 +1,1289 @@
+client = """Outclip backend - merit-based bounty marketplace for short-form video editors.
+
+Stack: FastAPI + MongoDB + Emergent Google OAuth + Emergent Object Storage + YouTube Data API v3.
+Razorpay escrow & payouts are MOCKED for MVP.
+"""
+from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, UploadFile, File, Form, Cookie, Header, Query
+from fastapi.responses import StreamingResponse
+from dotenv import load_dotenv
+from starlette.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
+import os, io, uuid, logging, re, requests
+from pathlib import Path
+from pydantic import BaseModel, Field
+from typing import List, Optional, Any
+from datetime import datetime, timezone, timedelta
+from supabase import create_client, Client
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / '.env')
+
+# ---------------- Config ----------------
+# MONGO_URL = os.environ['MONGO_URL']
+# DB_NAME = os.environ['DB_NAME']
+
+EMERGENT_KEY = os.environ.get('EMERGENT_LLM_KEY')
+APP_NAME = os.environ.get('APP_NAME', 'outclip')
+YOUTUBE_API_KEY = os.environ.get('YOUTUBE_API_KEY', '')
+PLATFORM_FEE = float(os.environ.get('PLATFORM_FEE_PERCENT', '15'))
+
+EMERGENT_AUTH_SESSION_URL = "https://demobackend.emergentagent.com/auth/v1/env/oauth/session-data"
+STORAGE_URL = "https://integrations.emergentagent.com/objstore/api/v1/storage"
+
+# client = AsyncIOMotorClient(MONGO_URL)
+# db = client[DB_NAME]
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
+
+supabase: Client = create_client(
+    SUPABASE_URL,
+    SUPABASE_SERVICE_KEY
+)
+
+app = FastAPI(title="Outclip API")
+api = APIRouter(prefix="/api")
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("outclip")
+
+# ---------------- Storage ----------------
+_storage_key: Optional[str] = None
+
+def init_storage():
+    global _storage_key
+    if _storage_key:
+        return _storage_key
+    if not EMERGENT_KEY:
+        raise RuntimeError("EMERGENT_LLM_KEY missing")
+    resp = requests.post(f"{STORAGE_URL}/init", json={"emergent_key": EMERGENT_KEY}, timeout=30)
+    resp.raise_for_status()
+    _storage_key = resp.json()["storage_key"]
+    return _storage_key
+
+def put_object(path: str, data: bytes, content_type: str) -> dict:
+    key = init_storage()
+    resp = requests.put(f"{STORAGE_URL}/objects/{path}",
+                        headers={"X-Storage-Key": key, "Content-Type": content_type},
+                        data=data, timeout=120)
+    resp.raise_for_status()
+    return resp.json()
+
+def get_object(path: str):
+    key = init_storage()
+    resp = requests.get(f"{STORAGE_URL}/objects/{path}", headers={"X-Storage-Key": key}, timeout=60)
+    resp.raise_for_status()
+    return resp.content, resp.headers.get("Content-Type", "application/octet-stream")
+
+# ---------------- Helpers ----------------
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def new_id(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex[:12]}"
+
+def parse_dt(v):
+    if isinstance(v, datetime):
+        if v.tzinfo is None:
+            v = v.replace(tzinfo=timezone.utc)
+        return v
+    if isinstance(v, str):
+        d = datetime.fromisoformat(v.replace('Z', '+00:00'))
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return d
+    return None
+
+def clean_doc(d):
+    if not d:
+        return d
+    d.pop('_id', None)
+    return d
+
+# ---------------- Points engine ----------------
+def retention_mult(p: float) -> float:
+    if p < 20: return 0.8
+    if p < 35: return 1.0
+    if p < 50: return 1.2
+    if p < 65: return 1.4
+    if p < 80: return 1.5
+    return 1.6
+
+def engagement_mult(p: float) -> float:
+    if p < 1: return 0.95
+    if p < 3: return 1.0
+    if p < 5: return 1.1
+    if p < 8: return 1.15
+    if p < 12: return 1.2
+    return 1.25
+
+def hit_mult(views: int) -> float:
+    if views >= 1_000_000: return 1.50
+    if views >= 500_000:   return 1.25
+    if views >= 100_000:   return 1.10
+    if views >= 50_000:    return 1.05
+    return 1.0
+
+def calc_points(views: int, retention_pct: float, engagement_pct: float):
+    rm = retention_mult(retention_pct)
+    em = engagement_mult(engagement_pct)
+    hm = hit_mult(views)
+    pts = float(views) * rm * em * hm
+    return {"points": round(pts, 2), "retention_mult": rm, "engagement_mult": em, "hit_mult": hm}
+
+# ---------------- YouTube ----------------
+YT_ID_RE = re.compile(r"(?:youtube\.com/(?:shorts/|watch\?v=)|youtu\.be/)([A-Za-z0-9_-]{11})")
+YT_CHANNEL_HANDLE_RE = re.compile(r"youtube\.com/@([A-Za-z0-9._-]+)")
+YT_CHANNEL_ID_RE = re.compile(r"youtube\.com/channel/(UC[A-Za-z0-9_-]{22})")
+
+def yt_video_id(url: str) -> Optional[str]:
+    m = YT_ID_RE.search(url or "")
+    return m.group(1) if m else None
+
+def fetch_youtube_channel(url_or_handle: str):
+    """Fetch channel info by URL/@handle/UC id. Falls back to manual storage if API key absent."""
+    s = (url_or_handle or "").strip()
+    if not s:
+        return None
+    handle = None
+    channel_id = None
+    m = YT_CHANNEL_ID_RE.search(s)
+    if m:
+        channel_id = m.group(1)
+    else:
+        m = YT_CHANNEL_HANDLE_RE.search(s)
+        if m:
+            handle = m.group(1)
+        elif s.startswith("@"):
+            handle = s[1:]
+        elif s.startswith("UC") and len(s) >= 24:
+            channel_id = s[:24]
+
+    if not YOUTUBE_API_KEY:
+        # Fallback: trust user input, no verification
+        return {
+            "channel_id": channel_id, "handle": handle, "title": handle or "YouTube Channel",
+            "thumbnail": None, "url": s if s.startswith("http") else (f"https://youtube.com/@{handle}" if handle else None),
+            "verified": False,
+        }
+    try:
+        params = {"part": "snippet,statistics", "key": YOUTUBE_API_KEY}
+        if channel_id:
+            params["id"] = channel_id
+        elif handle:
+            params["forHandle"] = "@" + handle
+        else:
+            return None
+        r = requests.get("https://www.googleapis.com/youtube/v3/channels", params=params, timeout=15)
+        r.raise_for_status()
+        items = r.json().get("items", [])
+        if not items:
+            return None
+        it = items[0]
+        sn = it.get("snippet", {})
+        st = it.get("statistics", {})
+        ch_id = it.get("id")
+        return {
+            "channel_id": ch_id, "handle": sn.get("customUrl", handle),
+            "title": sn.get("title", ""),
+            "thumbnail": (sn.get("thumbnails") or {}).get("default", {}).get("url"),
+            "url": f"https://youtube.com/channel/{ch_id}",
+            "subscribers": int(st.get("subscriberCount", 0)) if not st.get("hiddenSubscriberCount") else None,
+            "verified": True,
+        }
+    except Exception as e:
+        logger.warning(f"YouTube channel fetch failed: {e}")
+        return None
+
+def fetch_youtube_stats(url: str):
+    vid = yt_video_id(url)
+    if not vid or not YOUTUBE_API_KEY:
+        return None
+    try:
+        r = requests.get("https://www.googleapis.com/youtube/v3/videos",
+                         params={"id": vid, "part": "statistics,snippet", "key": YOUTUBE_API_KEY},
+                         timeout=15)
+        r.raise_for_status()
+        items = r.json().get("items", [])
+        if not items:
+            return None
+        s = items[0].get("statistics", {})
+        sn = items[0].get("snippet", {})
+        return {
+            "video_id": vid,
+            "title": sn.get("title", ""),
+            "channel_id": sn.get("channelId"),
+            "channel_title": sn.get("channelTitle"),
+            "views": int(s.get("viewCount", 0)),
+            "likes": int(s.get("likeCount", 0)),
+            "comments": int(s.get("commentCount", 0)),
+        }
+    except Exception as e:
+        logger.warning(f"YouTube fetch failed: {e}")
+        return None
+
+# ---------------- Auth ----------------
+async def get_current_user(request: Request,
+                           session_token: Optional[str] = Cookie(None),
+                           authorization: Optional[str] = Header(None)):
+
+    token = session_token
+
+    if not token and authorization and authorization.startswith("Bearer "):
+        token = authorization.split(" ", 1)[1]
+
+    if not token:
+        raise HTTPException(401, "Not authenticated")
+
+    user_resp = supabase.table("users").select("*").limit(1).execute()
+
+    if not user_resp.data:
+        raise HTTPException(401, "User not found")
+
+    return user_resp.data[0]
+
+async def require_role(user: dict, role: str):
+    if user.get("role") != role and user.get("role") != "ADMIN":
+        raise HTTPException(403, f"Requires role: {role}")
+
+# ---------------- Schemas ----------------
+class SetRoleIn(BaseModel):
+    role: str  # EDITOR | CREATOR
+
+class UpdateProfileIn(BaseModel):
+    username: Optional[str] = None
+    display_name: Optional[str] = None
+    bio: Optional[str] = None
+    active_platforms: Optional[List[str]] = None
+    is_earnings_public: Optional[bool] = None
+    payout_upi: Optional[str] = None
+    avatar_url: Optional[str] = None
+    socials: Optional[dict] = None  # {tiktok, youtube, instagram, twitter, discord}
+
+class FeaturedClipIn(BaseModel):
+    title: str
+    platform: str  # YOUTUBE_SHORTS | TIKTOK | INSTAGRAM_REELS
+    views: int = 0
+    points: float = 0
+    thumbnail_url: Optional[str] = None
+    video_url: Optional[str] = None
+
+class JoinCampaignIn(BaseModel):
+    youtube_channel: str  # URL or @handle
+
+class CashoutIn(BaseModel):
+    amount: float
+
+class CreateCampaignIn(BaseModel):
+    title: str
+    content_type: str
+    description: str
+    clip_guidelines: str = ""
+    bounty_pool: float
+    max_clips_per_editor: int = 10
+    start_date: str
+    end_date: str
+    source_video_urls: List[str] = []
+    allowed_platforms: List[str] = ["YOUTUBE_SHORTS", "TIKTOK", "INSTAGRAM_REELS"]
+    # Brief
+    brief: Optional[dict] = None  # { objective, target_audience, content_style, topics_focus, topics_avoid, hook_style, length_guidelines, caption_guidelines, video_type }
+    # Assets
+    assets: Optional[dict] = None  # { drive_links, raw_footage, logos, brand_assets, notes }
+    # Funding split (optional; if absent computed from bounty_pool)
+    editor_pool_pct: float = 60.0
+    performance_pool_pct: float = 30.0
+    bonus_pool_pct: float = 10.0
+    # Lock window
+    min_duration_days: int = 7
+    early_close_penalty_pct: float = 20.0
+
+class SubmitClipIn(BaseModel):
+    campaign_id: str
+    platform: str
+    clip_url: str
+    views: int
+    retention_pct: float
+    engagement_pct: float
+    analytics_screen_path: Optional[str] = None
+
+# ---------------- Auth routes ----------------
+@api.post("/auth/session")
+async def auth_session(request: Request, response: Response):
+    body = await request.json()
+    session_id = body.get("session_id")
+    if not session_id:
+        raise HTTPException(400, "session_id required")
+    r = requests.get(EMERGENT_AUTH_SESSION_URL, headers={"X-Session-ID": session_id}, timeout=15)
+    if r.status_code != 200:
+        raise HTTPException(401, "Invalid session_id")
+    data = r.json()
+    email = data["email"]
+    existing_resp = supabase.table("users").select("*").eq("email", email).execute()
+    existing = existing_resp.data[0] if existing_resp.data else None
+    if existing:
+        user = existing
+        supabase.table("users").update({
+            "name": data.get("name"),
+            "avatar_url": data.get("picture")
+        }).eq("user_id", user["user_id"]).execute()
+        user["name"] = data.get("name")
+        user["avatar_url"] = data.get("picture")
+    else:
+        user = {
+            "user_id": new_id("user"),
+            "email": email,
+            "name": data.get("name") or email.split("@")[0],
+            "username": (data.get("name") or email.split("@")[0]).replace(" ", "_").lower() + "_" + uuid.uuid4().hex[:4],
+            "avatar_url": data.get("picture"),
+            "role": None,  # set during onboarding
+            "bio": "",
+            "lifetime_points": 0.0,
+            "total_earnings": 0.0,
+            "active_platforms": [],
+            "is_earnings_public": False,
+            "payout_upi": "",
+            "created_at": now_iso(),
+        }
+        supabase.table("users").insert(user).execute()
+    token = data["session_token"]
+    expires = datetime.now(timezone.utc) + timedelta(days=7)
+    # await db.user_sessions.insert_one({
+    #     "user_id": user["user_id"], "session_token": token,
+    #     "expires_at": expires.isoformat(), "created_at": now_iso(),
+    # })
+    
+    response.set_cookie("session_token", token, httponly=True, secure=True,
+                        samesite="none", path="/", max_age=7 * 24 * 60 * 60)
+    return clean_doc(user)
+
+@api.get("/auth/me")
+async def auth_me(request: Request, session_token: Optional[str] = Cookie(None),
+                  authorization: Optional[str] = Header(None)):
+    user = await get_current_user(request, session_token, authorization)
+    return clean_doc(user)
+
+@api.post("/auth/logout")
+async def auth_logout(response: Response, session_token: Optional[str] = Cookie(None)):
+    if session_token:
+        await db.user_sessions.delete_one({"session_token": session_token})
+    response.delete_cookie("session_token", path="/")
+    return {"ok": True}
+
+@api.post("/auth/set-role")
+async def set_role(payload: SetRoleIn, request: Request,
+                   session_token: Optional[str] = Cookie(None),
+                   authorization: Optional[str] = Header(None)):
+    user = await get_current_user(request, session_token, authorization)
+    if payload.role not in ("EDITOR", "CREATOR"):
+        raise HTTPException(400, "Invalid role")
+    supabase.table("users").update({
+    "role": payload.role
+    }).eq("user_id", user["user_id"]).execute()
+    user["role"] = payload.role
+    return clean_doc(user)
+
+@api.put("/auth/profile")
+async def update_profile(payload: UpdateProfileIn, request: Request,
+                         session_token: Optional[str] = Cookie(None),
+                         authorization: Optional[str] = Header(None)):
+    user = await get_current_user(request, session_token, authorization)
+    upd = {k: v for k, v in payload.model_dump(exclude_none=True).items()}
+    # username uniqueness
+    if "username" in upd and upd["username"] != user.get("username"):
+        if await db.users.find_one({"username": upd["username"], "user_id": {"$ne": user["user_id"]}}, {"_id": 0}):
+            raise HTTPException(400, "Username already taken")
+    if "bio" in upd and len(upd["bio"]) > 160:
+        raise HTTPException(400, "Bio too long (max 160)")
+    if upd:
+        await db.users.update_one({"user_id": user["user_id"]}, {"$set": upd})
+    user2 = await db.users.find_one({"user_id": user["user_id"]}, {"_id": 0})
+    return clean_doc(user2)
+
+# ---------------- Featured clips on profile ----------------
+@api.post("/profile/featured-clips")
+async def add_featured_clip(payload: FeaturedClipIn, request: Request,
+                            session_token: Optional[str] = Cookie(None),
+                            authorization: Optional[str] = Header(None)):
+    user = await get_current_user(request, session_token, authorization)
+    fc = user.get("featured_clips") or []
+    if len(fc) >= 6:
+        raise HTTPException(400, "Max 6 featured clips")
+    item = dict(payload.model_dump())
+    item["id"] = new_id("fc")
+    fc.append(item)
+    await db.users.update_one({"user_id": user["user_id"]}, {"$set": {"featured_clips": fc}})
+    return item
+
+@api.delete("/profile/featured-clips/{clip_id}")
+async def remove_featured_clip(clip_id: str, request: Request,
+                               session_token: Optional[str] = Cookie(None),
+                               authorization: Optional[str] = Header(None)):
+    user = await get_current_user(request, session_token, authorization)
+    fc = [c for c in (user.get("featured_clips") or []) if c.get("id") != clip_id]
+    await db.users.update_one({"user_id": user["user_id"]}, {"$set": {"featured_clips": fc}})
+    return {"ok": True}
+
+# ---------------- Badges ----------------
+BADGES = [
+    {"id": "first_blood", "name": "First Blood", "icon": "🏆", "description": "Submitted your first clip"},
+    {"id": "viral_hit",   "name": "Viral Hit",   "icon": "⚡", "description": "A clip crossed 100K views"},
+    {"id": "hot_streak",  "name": "Hot Streak",  "icon": "🔥", "description": "Submitted clips in 3 campaigns consecutively"},
+    {"id": "top_3",       "name": "Top 3 Finish","icon": "💎", "description": "Finished Top 3 in any campaign"},
+    {"id": "winner",      "name": "Campaign Winner","icon":"👑", "description": "Finished #1 in a campaign"},
+    {"id": "midnight",    "name": "Midnight Grinder","icon":"🌙","description": "Submitted a clip between 12am–4am"},
+]
+
+async def compute_badges(user_id: str):
+    clips = await db.clips.find({"editor_id": user_id}, {"_id": 0}).to_list(2000)
+    parts = await db.participations.find({"editor_id": user_id}, {"_id": 0}).to_list(2000)
+    earned = set()
+    if clips:
+        earned.add("first_blood")
+    if any(c.get("views", 0) >= 100_000 for c in clips):
+        earned.add("viral_hit")
+    if len(parts) >= 3:
+        earned.add("hot_streak")
+    ranks = [p.get("rank") for p in parts if p.get("rank")]
+    if any(r <= 3 for r in ranks):
+        earned.add("top_3")
+    if any(r == 1 for r in ranks):
+        earned.add("winner")
+    for c in clips:
+        ts = c.get("submitted_at", "")
+        try:
+            hour = datetime.fromisoformat(ts.replace("Z", "+00:00")).hour
+            if 0 <= hour < 4:
+                earned.add("midnight"); break
+        except Exception:
+            pass
+    return [{**b, "earned": b["id"] in earned} for b in BADGES]
+
+# ---------------- Public profile by username ----------------
+async def build_public_profile(user: dict):
+    uid = user["user_id"]
+    clips = await db.clips.find({"editor_id": uid}, {"_id": 0}).to_list(2000)
+    parts = await db.participations.find({"editor_id": uid}, {"_id": 0}).to_list(2000)
+    total_views = sum(c.get("views", 0) for c in clips) + sum((fc.get("views") or 0) for fc in (user.get("featured_clips") or []))
+    total_points = user.get("lifetime_points") or sum(c.get("points", 0) for c in clips)
+    badges = await compute_badges(uid)
+    # campaign history
+    history = []
+    for p in parts:
+        c = await db.campaigns.find_one({"campaign_id": p["campaign_id"]}, {"_id": 0, "campaign_id": 1, "title": 1, "status": 1})
+        if not c: continue
+        history.append({
+            "campaign_id": c["campaign_id"], "title": c["title"], "status": c["status"],
+            "rank": p.get("rank"), "points": p.get("total_points", 0),
+            "payout": p.get("payout_amount", 0),
+        })
+    history.sort(key=lambda x: (x.get("rank") or 999))
+    return {
+        "user_id": uid,
+        "username": user.get("username"),
+        "display_name": user.get("display_name") or user.get("name"),
+        "name": user.get("name"),
+        "avatar_url": user.get("avatar_url"),
+        "bio": user.get("bio", ""),
+        "role": user.get("role"),
+        "socials": user.get("socials") or {},
+        "featured_clips": user.get("featured_clips") or [],
+        "total_views_generated": total_views,
+        "total_points_earned": round(total_points, 2),
+        "badges": badges,
+        "campaign_history": history,
+        "created_at": user.get("created_at"),
+    }
+
+@api.get("/profile/me/full")
+async def my_full_profile(request: Request,
+                          session_token: Optional[str] = Cookie(None),
+                          authorization: Optional[str] = Header(None)):
+    user = await get_current_user(request, session_token, authorization)
+    return await build_public_profile(user)
+
+@api.get("/profile/by-username/{username}")
+async def profile_by_username(username: str):
+    user = await db.users.find_one({"username": username}, {"_id": 0})
+    if not user:
+        raise HTTPException(404, "User not found")
+    p = await build_public_profile(user)
+    # public view: never expose campaign history (per spec)
+    p.pop("campaign_history", None)
+    return p
+
+# ---------------- Upload ----------------
+@api.post("/wallet/cashout")
+async def cashout(payload: CashoutIn, request: Request,
+                  session_token: Optional[str] = Cookie(None),
+                  authorization: Optional[str] = Header(None)):
+    """MOCK cashout — debits user's total_earnings and creates a withdrawal record."""
+    user = await get_current_user(request, session_token, authorization)
+    amt = float(payload.amount)
+    if amt <= 0:
+        raise HTTPException(400, "Amount must be > 0")
+    bal = float(user.get("total_earnings", 0))
+    if amt > bal:
+        raise HTTPException(400, f"Insufficient balance. Available: ₹{bal:.2f}")
+    await db.users.update_one({"user_id": user["user_id"]}, {"$inc": {"total_earnings": -amt}})
+    rec = {
+        "withdrawal_id": new_id("wd"), "user_id": user["user_id"],
+        "amount": round(amt, 2), "status": "COMPLETED",
+        "razorpay_payout_id": f"pout_mock_{uuid.uuid4().hex[:8]}",
+        "created_at": now_iso(),
+    }
+    await db.withdrawals.insert_one(dict(rec))
+    return {"ok": True, "withdrawal": clean_doc(rec), "remaining_balance": round(bal - amt, 2)}
+
+@api.get("/wallet/withdrawals")
+async def list_withdrawals(request: Request,
+                           session_token: Optional[str] = Cookie(None),
+                           authorization: Optional[str] = Header(None)):
+    user = await get_current_user(request, session_token, authorization)
+    docs = await db.withdrawals.find({"user_id": user["user_id"]}, {"_id": 0}).sort([("created_at", -1)]).to_list(200)
+    return docs
+
+@api.post("/upload")
+async def upload_file(request: Request, file: UploadFile = File(...),
+                      session_token: Optional[str] = Cookie(None),
+                      authorization: Optional[str] = Header(None)):
+    user = await get_current_user(request, session_token, authorization)
+    ext = (file.filename or "bin").rsplit(".", 1)[-1].lower()
+    path = f"{APP_NAME}/uploads/{user['user_id']}/{uuid.uuid4().hex}.{ext}"
+    data = await file.read()
+    if len(data) > 8 * 1024 * 1024:
+        raise HTTPException(400, "File too large (max 8MB)")
+    result = put_object(path, data, file.content_type or "application/octet-stream")
+    await db.files.insert_one({
+        "file_id": new_id("file"), "owner_id": user["user_id"],
+        "storage_path": result["path"], "original_filename": file.filename,
+        "content_type": file.content_type, "size": result["size"],
+        "is_deleted": False, "created_at": now_iso(),
+    })
+    return {"path": result["path"], "size": result["size"]}
+
+@api.get("/files/{path:path}")
+async def serve_file(path: str):
+    data, ct = get_object(path)
+    return Response(content=data, media_type=ct)
+
+# ---------------- Campaigns ----------------
+@api.get("/campaigns")
+async def list_campaigns(status: Optional[str] = None, content_type: Optional[str] = None,
+                         sort_by: str = "bounty_desc", mine: bool = False,
+                         request: Request = None,
+                         session_token: Optional[str] = Cookie(None),
+                         authorization: Optional[str] = Header(None)):
+    q = {}
+    if status:
+        q["status"] = status
+    if content_type:
+        q["content_type"] = content_type
+    if mine:
+        user = await get_current_user(request, session_token, authorization)
+        q["creator_id"] = user["user_id"]
+    sort_map = {
+        "bounty_desc": [("bounty_pool", -1)],
+        "ending_soon": [("end_date", 1)],
+        "newest": [("created_at", -1)],
+    }
+    docs = await db.campaigns.find(q, {"_id": 0}).sort(sort_map.get(sort_by, [("bounty_pool", -1)])).to_list(100)
+    # enrich with creator
+    for d in docs:
+        creator = await db.users.find_one({"user_id": d["creator_id"]}, {"_id": 0, "user_id": 1, "name": 1, "avatar_url": 1, "username": 1})
+        d["creator"] = clean_doc(creator) if creator else None
+        d["participant_count"] = await db.participations.count_documents({"campaign_id": d["campaign_id"]})
+    return docs
+
+@api.get("/campaigns/{campaign_id}")
+async def get_campaign(campaign_id: str):
+    c = await db.campaigns.find_one({"campaign_id": campaign_id}, {"_id": 0})
+    if not c:
+        raise HTTPException(404, "Campaign not found")
+    creator = await db.users.find_one({"user_id": c["creator_id"]}, {"_id": 0})
+    c["creator"] = clean_doc(creator)
+    c["participant_count"] = await db.participations.count_documents({"campaign_id": campaign_id})
+    c["clip_count"] = await db.clips.count_documents({"campaign_id": campaign_id})
+    return c
+
+@api.post("/campaigns")
+async def create_campaign(payload: CreateCampaignIn, request: Request,
+                          session_token: Optional[str] = Cookie(None),
+                          authorization: Optional[str] = Header(None)):
+    user = await get_current_user(request, session_token, authorization)
+    await require_role(user, "CREATOR")
+    cid = new_id("camp")
+    fee = float(payload.bounty_pool) * PLATFORM_FEE / 100.0
+    net = float(payload.bounty_pool) - fee
+    doc = {
+        "campaign_id": cid,
+        "creator_id": user["user_id"],
+        "title": payload.title,
+        "content_type": payload.content_type,
+        "description": payload.description,
+        "clip_guidelines": payload.clip_guidelines,
+        "bounty_pool": float(payload.bounty_pool),
+        "max_clips_per_editor": payload.max_clips_per_editor,
+        "platform_fee_percent": PLATFORM_FEE,
+        "platform_fee_amount": round(fee, 2),
+        "net_pool": round(net, 2),
+        "editor_pool_pct": payload.editor_pool_pct,
+        "performance_pool_pct": payload.performance_pool_pct,
+        "bonus_pool_pct": payload.bonus_pool_pct,
+        "min_duration_days": payload.min_duration_days,
+        "early_close_penalty_pct": payload.early_close_penalty_pct,
+        "escrow_funded": False,
+        "escrow_order_id": None,
+        "status": "DRAFT",
+        "start_date": payload.start_date,
+        "end_date": payload.end_date,
+        "source_video_urls": payload.source_video_urls,
+        "allowed_platforms": payload.allowed_platforms,
+        "brief": payload.brief or {},
+        "assets": payload.assets or {},
+        "total_points": 0.0,
+        "total_views": 0,
+        "created_at": now_iso(),
+    }
+    await db.campaigns.insert_one(dict(doc))
+    return clean_doc(doc)
+
+@api.post("/campaigns/{campaign_id}/clone")
+async def clone_campaign(campaign_id: str, request: Request,
+                         session_token: Optional[str] = Cookie(None),
+                         authorization: Optional[str] = Header(None)):
+    user = await get_current_user(request, session_token, authorization)
+    await require_role(user, "CREATOR")
+    src = await db.campaigns.find_one({"campaign_id": campaign_id}, {"_id": 0})
+    if not src:
+        raise HTTPException(404, "Not found")
+    new_doc = dict(src)
+    new_doc["campaign_id"] = new_id("camp")
+    new_doc["creator_id"] = user["user_id"]
+    new_doc["title"] = f"{src['title']} (Copy)"
+    new_doc["status"] = "DRAFT"
+    new_doc["escrow_funded"] = False
+    new_doc["escrow_order_id"] = None
+    new_doc["total_points"] = 0.0
+    new_doc["total_views"] = 0
+    new_doc["created_at"] = now_iso()
+    new_doc.pop("published_at", None)
+    await db.campaigns.insert_one(dict(new_doc))
+    return clean_doc(new_doc)
+
+@api.post("/campaigns/{campaign_id}/publish")
+async def publish_campaign(campaign_id: str, request: Request,
+                           session_token: Optional[str] = Cookie(None),
+                           authorization: Optional[str] = Header(None)):
+    """Publish campaign — debits creator's wallet for the bounty pool (mock escrow)."""
+    user = await get_current_user(request, session_token, authorization)
+    c = await db.campaigns.find_one({"campaign_id": campaign_id}, {"_id": 0})
+    if not c:
+        raise HTTPException(404, "Not found")
+    if c["creator_id"] != user["user_id"]:
+        raise HTTPException(403, "Not your campaign")
+    if c["status"] != "DRAFT":
+        raise HTTPException(400, "Already published")
+    bal = float(user.get("wallet_balance", 0))
+    if bal < c["bounty_pool"]:
+        raise HTTPException(400, f"Insufficient wallet balance. Need ₹{c['bounty_pool']:.2f}, have ₹{bal:.2f}. Add funds first.")
+    mock_order = f"order_mock_{uuid.uuid4().hex[:10]}"
+    await db.users.update_one({"user_id": user["user_id"]}, {"$inc": {"wallet_balance": -c["bounty_pool"]}})
+    await db.transactions.insert_one({
+        "tx_id": new_id("tx"), "user_id": user["user_id"], "type": "CAMPAIGN_FUNDING",
+        "amount": -float(c["bounty_pool"]), "campaign_id": campaign_id,
+        "description": f"Funded campaign '{c['title']}'", "created_at": now_iso(),
+    })
+    await db.campaigns.update_one({"campaign_id": campaign_id},
+                                  {"$set": {"status": "OPEN", "escrow_funded": True,
+                                            "escrow_order_id": mock_order,
+                                            "published_at": now_iso()}})
+    return {"campaign_id": campaign_id, "escrow_order_id": mock_order, "status": "OPEN"}
+
+@api.post("/campaigns/{campaign_id}/cancel")
+async def cancel_campaign(campaign_id: str, request: Request,
+                          session_token: Optional[str] = Cookie(None),
+                          authorization: Optional[str] = Header(None)):
+    user = await get_current_user(request, session_token, authorization)
+    c = await db.campaigns.find_one({"campaign_id": campaign_id}, {"_id": 0})
+    if not c or c["creator_id"] != user["user_id"]:
+        raise HTTPException(403, "Forbidden")
+    # Early-close penalty if within min_duration window after publish
+    refund = 0.0
+    penalty = 0.0
+    if c.get("escrow_funded"):
+        published = parse_dt(c.get("published_at"))
+        min_days = int(c.get("min_duration_days", 7))
+        early = published and (datetime.now(timezone.utc) - published).days < min_days
+        pool = float(c.get("bounty_pool", 0))
+        if early:
+            penalty_pct = float(c.get("early_close_penalty_pct", 20.0))
+            penalty = round(pool * penalty_pct / 100.0, 2)
+            refund = round(pool - penalty, 2)
+        else:
+            refund = pool
+        if refund > 0:
+            await db.users.update_one({"user_id": user["user_id"]}, {"$inc": {"wallet_balance": refund}})
+            await db.transactions.insert_one({
+                "tx_id": new_id("tx"), "user_id": user["user_id"], "type": "REFUND",
+                "amount": refund, "campaign_id": campaign_id,
+                "description": f"Refund for cancelled campaign '{c['title']}'"
+                               + (f" (early-close penalty ₹{penalty:.2f})" if penalty > 0 else ""),
+                "created_at": now_iso(),
+            })
+        if penalty > 0:
+            await db.transactions.insert_one({
+                "tx_id": new_id("tx"), "user_id": user["user_id"], "type": "PENALTY",
+                "amount": -penalty, "campaign_id": campaign_id,
+                "description": f"Early-close penalty ({c.get('early_close_penalty_pct', 20)}%)",
+                "created_at": now_iso(),
+            })
+    await db.campaigns.update_one({"campaign_id": campaign_id}, {"$set": {"status": "CANCELLED"}})
+    return {"ok": True, "refund": refund, "penalty": penalty}
+
+@api.post("/campaigns/{campaign_id}/approve-payout")
+async def approve_payout(campaign_id: str, request: Request,
+                         session_token: Optional[str] = Cookie(None),
+                         authorization: Optional[str] = Header(None)):
+    """Distribute payouts. Refund undistributed remainder to creator wallet."""
+    user = await get_current_user(request, session_token, authorization)
+    c = await db.campaigns.find_one({"campaign_id": campaign_id}, {"_id": 0})
+    if not c or c["creator_id"] != user["user_id"]:
+        raise HTTPException(403, "Forbidden")
+    if c["status"] not in ("OPEN", "CLOSING_SOON", "UNDER_REVIEW"):
+        raise HTTPException(400, "Cannot payout this campaign yet")
+    await recompute_campaign(campaign_id)
+    c = await db.campaigns.find_one({"campaign_id": campaign_id}, {"_id": 0})
+    total = c.get("total_points", 0.0)
+    fee_amt = float(c["bounty_pool"]) * PLATFORM_FEE / 100.0
+    pool_net = float(c["bounty_pool"]) - fee_amt
+    parts = await db.participations.find({"campaign_id": campaign_id}, {"_id": 0}).to_list(1000)
+    distributed = 0.0
+    for p in parts:
+        share = (p["total_points"] / total) if total > 0 else 0.0
+        amount = round(pool_net * share, 2)
+        if amount <= 0: continue
+        distributed += amount
+        await db.participations.update_one(
+            {"participation_id": p["participation_id"]},
+            {"$set": {"reward_share_pct": round(share * 100, 2),
+                      "payout_amount": amount, "payout_status": "COMPLETED"}})
+        await db.payouts.insert_one({
+            "payout_id": new_id("pay"), "campaign_id": campaign_id,
+            "editor_id": p["editor_id"], "amount": amount,
+            "status": "COMPLETED", "razorpay_payout_id": f"pout_mock_{uuid.uuid4().hex[:8]}",
+            "created_at": now_iso(), "processed_at": now_iso(),
+        })
+        await db.users.update_one({"user_id": p["editor_id"]}, {"$inc": {"total_earnings": amount}})
+        await db.transactions.insert_one({
+            "tx_id": new_id("tx"), "user_id": user["user_id"], "type": "PAYOUT",
+            "amount": -amount, "campaign_id": campaign_id,
+            "description": f"Payout to editor for '{c['title']}'",
+            "created_at": now_iso(),
+        })
+    # Refund undistributed remainder
+    leftover = round(pool_net - distributed, 2)
+    if leftover > 0:
+        await db.users.update_one({"user_id": user["user_id"]}, {"$inc": {"wallet_balance": leftover}})
+        await db.transactions.insert_one({
+            "tx_id": new_id("tx"), "user_id": user["user_id"], "type": "REFUND",
+            "amount": leftover, "campaign_id": campaign_id,
+            "description": f"Unused funds refunded from '{c['title']}'",
+            "created_at": now_iso(),
+        })
+    # Platform fee transaction record
+    await db.transactions.insert_one({
+        "tx_id": new_id("tx"), "user_id": user["user_id"], "type": "PLATFORM_FEE",
+        "amount": -round(fee_amt, 2), "campaign_id": campaign_id,
+        "description": f"Platform fee ({PLATFORM_FEE}%) for '{c['title']}'",
+        "created_at": now_iso(),
+    })
+    await db.campaigns.update_one({"campaign_id": campaign_id}, {"$set": {"status": "COMPLETED"}})
+    return {"ok": True, "distributed": distributed, "refunded": leftover, "fee": fee_amt}
+
+# ---------------- Creator Wallet ----------------
+class AddFundsIn(BaseModel):
+    amount: float
+
+@api.post("/wallet/add-funds")
+async def add_funds(payload: AddFundsIn, request: Request,
+                    session_token: Optional[str] = Cookie(None),
+                    authorization: Optional[str] = Header(None)):
+    user = await get_current_user(request, session_token, authorization)
+    amt = float(payload.amount)
+    if amt <= 0:
+        raise HTTPException(400, "Amount must be > 0")
+    await db.users.update_one({"user_id": user["user_id"]}, {"$inc": {"wallet_balance": amt}})
+    await db.transactions.insert_one({
+        "tx_id": new_id("tx"), "user_id": user["user_id"], "type": "TOP_UP",
+        "amount": amt, "description": "Wallet top-up (mock)",
+        "razorpay_payment_id": f"pay_mock_{uuid.uuid4().hex[:10]}",
+        "created_at": now_iso(),
+    })
+    user2 = await db.users.find_one({"user_id": user["user_id"]}, {"_id": 0})
+    return {"ok": True, "balance": user2.get("wallet_balance", 0)}
+
+@api.get("/wallet/transactions")
+async def wallet_transactions(request: Request, limit: int = 100,
+                              session_token: Optional[str] = Cookie(None),
+                              authorization: Optional[str] = Header(None)):
+    user = await get_current_user(request, session_token, authorization)
+    docs = await db.transactions.find({"user_id": user["user_id"]}, {"_id": 0}).sort([("created_at", -1)]).limit(limit).to_list(limit)
+    return docs
+
+@api.get("/wallet/creator-summary")
+async def creator_wallet_summary(request: Request,
+                                 session_token: Optional[str] = Cookie(None),
+                                 authorization: Optional[str] = Header(None)):
+    user = await get_current_user(request, session_token, authorization)
+    camps = await db.campaigns.find({"creator_id": user["user_id"]}, {"_id": 0}).to_list(500)
+    spend = 0.0
+    pending = 0.0
+    in_escrow = 0.0
+    for c in camps:
+        if c.get("escrow_funded"):
+            if c["status"] == "COMPLETED":
+                spend += float(c.get("bounty_pool", 0))
+            elif c["status"] in ("OPEN", "CLOSING_SOON", "UNDER_REVIEW"):
+                in_escrow += float(c.get("bounty_pool", 0))
+                pending += float(c.get("bounty_pool", 0))
+    return {
+        "balance": round(float(user.get("wallet_balance", 0)), 2),
+        "total_spend": round(spend, 2),
+        "in_escrow": round(in_escrow, 2),
+        "pending_payouts": round(pending, 2),
+    }
+
+# ---------------- Creator Dashboard ----------------
+def _tier(points: float) -> str:
+    if points >= 50000: return "DIAMOND"
+    if points >= 20000: return "PLATINUM"
+    if points >= 10000: return "GOLD"
+    if points >= 5000:  return "SILVER"
+    if points >= 1000:  return "BRONZE"
+    return "ROOKIE"
+
+def _elo(points: float) -> int:
+    # simple deterministic mapping
+    return int(1000 + min(points, 50000) * 0.06)
+
+@api.get("/dashboard/creator")
+async def creator_dashboard(request: Request,
+                            session_token: Optional[str] = Cookie(None),
+                            authorization: Optional[str] = Header(None)):
+    user = await get_current_user(request, session_token, authorization)
+    await require_role(user, "CREATOR")
+    camps = await db.campaigns.find({"creator_id": user["user_id"]}, {"_id": 0}).to_list(500)
+    camp_ids = [c["campaign_id"] for c in camps]
+    clips = await db.clips.find({"campaign_id": {"$in": camp_ids}}, {"_id": 0}).to_list(5000)
+
+    total_views = sum(c.get("views", 0) for c in clips)
+    total_clips = len(clips)
+    editors_set = {c["editor_id"] for c in clips}
+    avg_ret = round(sum(c.get("retention_pct", 0) for c in clips) / len(clips), 2) if clips else 0.0
+    total_spend = sum(float(c.get("bounty_pool", 0)) for c in camps if c.get("escrow_funded"))
+
+    # Top performing clips
+    top_clips = sorted(clips, key=lambda x: x.get("points", 0), reverse=True)[:6]
+    enriched_clips = []
+    for cl in top_clips:
+        ed = await db.users.find_one({"user_id": cl["editor_id"]}, {"_id": 0, "name": 1, "username": 1, "avatar_url": 1, "user_id": 1})
+        enriched_clips.append({
+            "clip_id": cl["clip_id"], "clip_url": cl["clip_url"], "platform": cl["platform"],
+            "views": cl["views"], "retention_pct": cl["retention_pct"],
+            "engagement_pct": cl["engagement_pct"], "points": cl["points"],
+            "thumbnail": (cl.get("yt_meta") or {}).get("thumbnail"),
+            "editor": clean_doc(ed) if ed else None,
+        })
+
+    # Top editors aggregation
+    by_editor = {}
+    for cl in clips:
+        e = by_editor.setdefault(cl["editor_id"], {"views": 0, "points": 0, "earnings": 0.0, "clips": 0})
+        e["views"] += cl.get("views", 0)
+        e["points"] += cl.get("points", 0)
+        e["clips"] += 1
+    # earnings via participations
+    parts_all = await db.participations.find({"campaign_id": {"$in": camp_ids}}, {"_id": 0}).to_list(5000)
+    for p in parts_all:
+        if p["editor_id"] in by_editor:
+            by_editor[p["editor_id"]]["earnings"] += float(p.get("payout_amount", 0))
+    top_editors = sorted(by_editor.items(), key=lambda x: x[1]["points"], reverse=True)[:6]
+    enriched_editors = []
+    for eid, agg in top_editors:
+        ed = await db.users.find_one({"user_id": eid}, {"_id": 0})
+        lp = float((ed or {}).get("lifetime_points", 0))
+        enriched_editors.append({
+            "editor": clean_doc(ed) if ed else None,
+            "views_generated": agg["views"],
+            "earnings_generated": round(agg["earnings"], 2),
+            "points": round(agg["points"], 2),
+            "elo": _elo(lp), "tier": _tier(lp),
+        })
+
+    # Timeline by month for last 6 months
+    from collections import defaultdict
+    bucket = defaultdict(lambda: {"views": 0, "clips": 0, "points": 0})
+    for cl in clips:
+        ts = cl.get("submitted_at", "")
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            key = dt.strftime("%Y-%m")
+            bucket[key]["views"] += cl.get("views", 0)
+            bucket[key]["clips"] += 1
+            bucket[key]["points"] += cl.get("points", 0)
+        except Exception:
+            pass
+    timeline = [{"month": k, **v} for k, v in sorted(bucket.items())][-6:]
+
+    # Content type distribution (for pie)
+    type_dist = defaultdict(int)
+    for c in camps:
+        type_dist[c.get("content_type", "OTHER")] += 1
+
+    return {
+        "stats": {
+            "total_views": total_views,
+            "total_clips": total_clips,
+            "total_editors": len(editors_set),
+            "avg_retention": avg_ret,
+            "total_spend": round(total_spend, 2),
+        },
+        "top_clips": enriched_clips,
+        "top_editors": enriched_editors,
+        "timeline": timeline,
+        "content_type_distribution": [{"name": k, "value": v} for k, v in type_dist.items()],
+    }
+
+# ---------------- Talent (editor discovery) ----------------
+@api.get("/talent")
+async def talent(niche: Optional[str] = None, tier: Optional[str] = None,
+                 min_lifetime_views: int = 0, min_retention: float = 0.0,
+                 sort_by: str = "elo_desc"):
+    users = await db.users.find({"role": "EDITOR"}, {"_id": 0}).to_list(500)
+    out = []
+    for u in users:
+        uid = u["user_id"]
+        clips = await db.clips.find({"editor_id": uid}, {"_id": 0}).to_list(2000)
+        lifetime_views = sum(c.get("views", 0) for c in clips)
+        avg_ret = round(sum(c.get("retention_pct", 0) for c in clips) / len(clips), 2) if clips else 0.0
+        camps_completed = await db.participations.count_documents({"editor_id": uid})
+        lp = float(u.get("lifetime_points", 0))
+        t = _tier(lp)
+        if tier and t != tier: continue
+        if niche and niche.lower() not in (u.get("bio", "") or "").lower(): continue
+        if lifetime_views < min_lifetime_views: continue
+        if avg_ret < min_retention: continue
+        out.append({
+            "user_id": uid, "name": u.get("display_name") or u.get("name"),
+            "username": u.get("username"), "avatar_url": u.get("avatar_url"),
+            "bio": u.get("bio", ""),
+            "lifetime_points": lp, "elo": _elo(lp), "tier": t,
+            "lifetime_views": lifetime_views, "lifetime_earnings": float(u.get("total_earnings", 0)),
+            "avg_retention": avg_ret, "campaigns_completed": camps_completed,
+        })
+    if sort_by == "elo_desc":
+        out.sort(key=lambda x: x["elo"], reverse=True)
+    elif sort_by == "views_desc":
+        out.sort(key=lambda x: x["lifetime_views"], reverse=True)
+    elif sort_by == "retention_desc":
+        out.sort(key=lambda x: x["avg_retention"], reverse=True)
+    return out
+
+# ---------------- Participations ----------------
+@api.post("/campaigns/{campaign_id}/join")
+async def join_campaign(payload: JoinCampaignIn, campaign_id: str, request: Request,
+                        session_token: Optional[str] = Cookie(None),
+                        authorization: Optional[str] = Header(None)):
+    user = await get_current_user(request, session_token, authorization)
+    await require_role(user, "EDITOR")
+    c = await db.campaigns.find_one({"campaign_id": campaign_id}, {"_id": 0})
+    if not c:
+        raise HTTPException(404, "Not found")
+    if c["status"] not in ("OPEN", "CLOSING_SOON"):
+        raise HTTPException(400, "Campaign not joinable")
+    channel = fetch_youtube_channel(payload.youtube_channel)
+    if not channel:
+        raise HTTPException(400, "Could not resolve YouTube channel. Paste full channel URL or @handle.")
+    existing = await db.participations.find_one({"campaign_id": campaign_id, "editor_id": user["user_id"]}, {"_id": 0})
+    if existing:
+        await db.participations.update_one(
+            {"participation_id": existing["participation_id"]},
+            {"$set": {"yt_channel": channel}})
+        existing["yt_channel"] = channel
+        return clean_doc(existing)
+    doc = {
+        "participation_id": new_id("part"),
+        "campaign_id": campaign_id,
+        "editor_id": user["user_id"],
+        "yt_channel": channel,
+        "joined_at": now_iso(),
+        "total_points": 0.0,
+        "rank": None,
+        "reward_share_pct": None,
+        "payout_amount": 0.0,
+        "payout_status": "PENDING",
+    }
+    await db.participations.insert_one(dict(doc))
+    return clean_doc(doc)
+
+# ---------------- Clips ----------------
+async def recompute_campaign(campaign_id: str):
+    clips = await db.clips.find({"campaign_id": campaign_id}, {"_id": 0}).to_list(10000)
+    editor_totals = {}
+    total = 0.0
+    for clip in clips:
+        editor_totals[clip["editor_id"]] = editor_totals.get(clip["editor_id"], 0.0) + clip["points"]
+        total += clip["points"]
+    await db.campaigns.update_one({"campaign_id": campaign_id}, {"$set": {"total_points": round(total, 2)}})
+    # update participations and ranks
+    sorted_parts = sorted(editor_totals.items(), key=lambda x: x[1], reverse=True)
+    for rank, (editor_id, pts) in enumerate(sorted_parts, start=1):
+        share = (pts / total * 100) if total > 0 else 0.0
+        await db.participations.update_one(
+            {"campaign_id": campaign_id, "editor_id": editor_id},
+            {"$set": {"total_points": round(pts, 2), "rank": rank, "reward_share_pct": round(share, 2)}})
+
+@api.post("/clips")
+async def submit_clip(payload: SubmitClipIn, request: Request,
+                      session_token: Optional[str] = Cookie(None),
+                      authorization: Optional[str] = Header(None)):
+    user = await get_current_user(request, session_token, authorization)
+    await require_role(user, "EDITOR")
+    c = await db.campaigns.find_one({"campaign_id": payload.campaign_id}, {"_id": 0})
+    if not c:
+        raise HTTPException(404, "Campaign not found")
+    if c["status"] not in ("OPEN", "CLOSING_SOON"):
+        raise HTTPException(400, "Campaign not accepting clips")
+    # ensure joined
+    part = await db.participations.find_one({"campaign_id": payload.campaign_id, "editor_id": user["user_id"]}, {"_id": 0})
+    if not part:
+        raise HTTPException(400, "Join the campaign first")
+    existing_count = await db.clips.count_documents({"campaign_id": payload.campaign_id, "editor_id": user["user_id"]})
+    if existing_count >= c["max_clips_per_editor"]:
+        raise HTTPException(400, "Max clips reached")
+
+    pts = calc_points(payload.views, payload.retention_pct, payload.engagement_pct)
+    yt_meta = fetch_youtube_stats(payload.clip_url) if payload.platform == "YOUTUBE_SHORTS" else None
+
+    # Auto-verify clip channel matches editor's connected channel for this campaign
+    if payload.platform == "YOUTUBE_SHORTS" and yt_meta and yt_meta.get("channel_id"):
+        connected = (part or {}).get("yt_channel") or {}
+        connected_id = connected.get("channel_id")
+        connected_handle = (connected.get("handle") or "").lstrip("@").lower()
+        clip_channel_id = yt_meta["channel_id"]
+        clip_channel_title = (yt_meta.get("channel_title") or "").lower()
+        ok = False
+        if connected_id and connected_id == clip_channel_id:
+            ok = True
+        elif connected_handle and connected_handle in clip_channel_title:
+            ok = True
+        if not ok:
+            raise HTTPException(
+                400,
+                f"Channel mismatch — clip is from '{yt_meta.get('channel_title')}' "
+                f"but your connected channel is '{connected.get('title') or connected.get('handle')}'. "
+                f"Upload from your connected channel or reconnect a different channel for this campaign."
+            )
+
+    doc = {
+        "clip_id": new_id("clip"),
+        "campaign_id": payload.campaign_id,
+        "editor_id": user["user_id"],
+        "platform": payload.platform,
+        "clip_url": payload.clip_url,
+        "views": payload.views,
+        "retention_pct": payload.retention_pct,
+        "engagement_pct": payload.engagement_pct,
+        "points": pts["points"],
+        "retention_mult": pts["retention_mult"],
+        "engagement_mult": pts["engagement_mult"],
+        "hit_mult": pts["hit_mult"],
+        "analytics_screen_path": payload.analytics_screen_path,
+        "analytics_verified": bool(yt_meta),  # auto-verified if YT API confirmed
+        "yt_meta": yt_meta,
+        "submitted_at": now_iso(),
+    }
+    await db.clips.insert_one(dict(doc))
+    await recompute_campaign(payload.campaign_id)
+    # update lifetime points for editor
+    total_lifetime = 0.0
+    async for cl in db.clips.find({"editor_id": user["user_id"]}, {"_id": 0, "points": 1}):
+        total_lifetime += cl["points"]
+    await db.users.update_one({"user_id": user["user_id"]}, {"$set": {"lifetime_points": round(total_lifetime, 2)}})
+    return clean_doc(doc)
+
+@api.get("/clips")
+async def list_clips(campaign_id: Optional[str] = None, editor_id: Optional[str] = None):
+    q = {}
+    if campaign_id: q["campaign_id"] = campaign_id
+    if editor_id: q["editor_id"] = editor_id
+    clips = await db.clips.find(q, {"_id": 0}).sort([("submitted_at", -1)]).to_list(500)
+    for cl in clips:
+        ed = await db.users.find_one({"user_id": cl["editor_id"]}, {"_id": 0, "user_id": 1, "name": 1, "username": 1, "avatar_url": 1})
+        cl["editor"] = clean_doc(ed) if ed else None
+    return clips
+
+@api.post("/youtube/fetch")
+async def youtube_fetch(payload: dict, request: Request,
+                        session_token: Optional[str] = Cookie(None),
+                        authorization: Optional[str] = Header(None)):
+    _ = await get_current_user(request, session_token, authorization)
+    meta = fetch_youtube_stats(payload.get("clip_url", ""))
+    if not meta:
+        return {"ok": False, "message": "Could not fetch. Enter analytics manually."}
+    # estimated engagement %: (likes+comments)/views *100
+    engagement = 0.0
+    if meta["views"] > 0:
+        engagement = round((meta["likes"] + meta["comments"]) / meta["views"] * 100.0, 2)
+    return {"ok": True, "views": meta["views"], "likes": meta["likes"],
+            "comments": meta["comments"], "engagement_pct": engagement,
+            "title": meta["title"]}
+
+# ---------------- Leaderboard ----------------
+@api.get("/leaderboard/campaign/{campaign_id}")
+async def leaderboard_campaign(campaign_id: str):
+    parts = await db.participations.find({"campaign_id": campaign_id}, {"_id": 0}).sort([("total_points", -1)]).to_list(200)
+    c = await db.campaigns.find_one({"campaign_id": campaign_id}, {"_id": 0})
+    pool_net = (c["bounty_pool"] * (1 - PLATFORM_FEE / 100.0)) if c else 0.0
+    total = c.get("total_points", 0.0) if c else 0.0
+    out = []
+    for i, p in enumerate(parts, start=1):
+        ed = await db.users.find_one({"user_id": p["editor_id"]}, {"_id": 0, "user_id": 1, "name": 1, "username": 1, "avatar_url": 1})
+        clips = await db.clips.find({"campaign_id": campaign_id, "editor_id": p["editor_id"]}, {"_id": 0}).to_list(100)
+        best = max(clips, key=lambda x: x["points"], default=None)
+        share = (p["total_points"] / total) if total > 0 else 0.0
+        out.append({
+            "rank": i, "editor": clean_doc(ed),
+            "yt_channel": p.get("yt_channel"),
+            "total_points": p["total_points"], "clips_submitted": len(clips),
+            "best_clip": {"points": best["points"], "views": best["views"]} if best else None,
+            "reward_share_pct": round(share * 100, 2),
+            "projected_payout": round(pool_net * share, 2),
+        })
+    return out
+
+@api.get("/leaderboard/lifetime")
+async def leaderboard_lifetime(limit: int = 25):
+    users = await db.users.find({"role": "EDITOR"}, {"_id": 0}).sort([("lifetime_points", -1)]).limit(limit).to_list(limit)
+    out = []
+    for i, u in enumerate(users, start=1):
+        out.append({"rank": i, "editor": clean_doc(u),
+                    "lifetime_points": u.get("lifetime_points", 0.0),
+                    "total_earnings": u.get("total_earnings", 0.0)})
+    return out
+
+@api.get("/leaderboard/monthly")
+async def leaderboard_monthly(limit: int = 25):
+    start = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    pipeline = [
+        {"$match": {"submitted_at": {"$gte": start.isoformat()}}},
+        {"$group": {"_id": "$editor_id", "points": {"$sum": "$points"}, "clips": {"$sum": 1}}},
+        {"$sort": {"points": -1}}, {"$limit": limit},
+    ]
+    docs = await db.clips.aggregate(pipeline).to_list(limit)
+    out = []
+    for i, d in enumerate(docs, start=1):
+        ed = await db.users.find_one({"user_id": d["_id"]}, {"_id": 0})
+        out.append({"rank": i, "editor": clean_doc(ed),
+                    "monthly_points": round(d["points"], 2), "clips": d["clips"]})
+    return out
+
+# ---------------- Dashboard ----------------
+@api.get("/dashboard")
+async def dashboard(request: Request,
+                    session_token: Optional[str] = Cookie(None),
+                    authorization: Optional[str] = Header(None)):
+
+    user = await get_current_user(request, session_token, authorization)
+
+    return {
+        "role": user.get("role"),
+        "stats": {},
+        "active_campaigns": [],
+        "recent_clips": [],
+        "my_campaigns": [],
+        "top_editors": []
+    }
+
+# ---------------- Profile ----------------
+@api.get("/users/{user_id}")
+async def get_user_profile(user_id: str):
+    u = await db.users.find_one({"user_id": user_id}, {"_id": 0})
+    if not u:
+        raise HTTPException(404, "Not found")
+    if u.get("role") == "EDITOR":
+        clips = await db.clips.find({"editor_id": user_id}, {"_id": 0}).sort([("points", -1)]).limit(12).to_list(12)
+        camps_played = await db.participations.count_documents({"editor_id": user_id})
+        u["clips"] = clips
+        u["campaigns_played"] = camps_played
+    elif u.get("role") == "CREATOR":
+        camps = await db.campaigns.find({"creator_id": user_id}, {"_id": 0}).to_list(50)
+        u["campaigns"] = camps
+        total_paid = 0.0
+        for c in camps:
+            payouts = await db.payouts.find({"campaign_id": c["campaign_id"]}, {"_id": 0}).to_list(200)
+            total_paid += sum(p.get("amount", 0) for p in payouts)
+        u["total_paid_out"] = round(total_paid, 2)
+    return clean_doc(u)
+
+# ---------------- Resources (static seed) ----------------
+@api.get("/resources")
+async def list_resources():
+    return [
+        {"id": "yt-algo-2026", "category": "Platform Guides",
+         "title": "YouTube Shorts Algorithm — 2026 Edition",
+         "summary": "How retention swipe-away, Average View Duration and hook strength move you up the curve.",
+         "read_minutes": 8, "tag": "YOUTUBE"},
+        {"id": "tiktok-2026", "category": "Platform Guides",
+         "title": "TikTok For You Page Mechanics",
+         "summary": "Why first-3-seconds retention matters more than likes. Practical hooks that work today.",
+         "read_minutes": 6, "tag": "TIKTOK"},
+        {"id": "hook-construction", "category": "Editing Techniques",
+         "title": "Hook Construction in 7 Patterns",
+         "summary": "Pattern library: pattern interrupt, controversy, payoff promise, contrast cut, etc.",
+         "read_minutes": 10, "tag": "CRAFT"},
+        {"id": "cut-timing", "category": "Editing Techniques",
+         "title": "Cut Timing & Rhythm",
+         "summary": "Beat-mapped cuts, J-cuts, L-cuts — when and why.", "read_minutes": 7, "tag": "CRAFT"},
+        {"id": "points-system", "category": "Outclip Guides",
+         "title": "The Outclip Points Formula Explained",
+         "summary": "Views × Retention × Engagement × Hit Multiplier. What moves the needle the most.",
+         "read_minutes": 5, "tag": "OUTCLIP"},
+        {"id": "analytics-screens", "category": "Outclip Guides",
+         "title": "Submitting Verifiable Analytics Screenshots",
+         "summary": "What we need to see, how to capture it, common mistakes.",
+         "read_minutes": 4, "tag": "OUTCLIP"},
+        {"id": "captions-overlays", "category": "Editing Techniques",
+         "title": "Captions & Overlays That Convert",
+         "summary": "Font weight, position, color contrast — measurable retention gains.",
+         "read_minutes": 6, "tag": "CRAFT"},
+        {"id": "ig-reels-2026", "category": "Platform Guides",
+         "title": "Instagram Reels — Native vs Repurposed",
+         "summary": "Why a TikTok watermark can suppress reach. How to repackage cleanly.",
+         "read_minutes": 5, "tag": "INSTAGRAM"},
+    ]
+
+# ---------------- Mount ----------------
+app.include_router(api)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_credentials=True,
+    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.on_event("startup")
+async def startup():
+    try:
+        init_storage()
+        logger.info("Storage initialized")
+    except Exception as e:
+        logger.warning(f"Storage init failed (will retry on first upload): {e}")
+
+@app.on_event("shutdown")
+async def shutdown():
+    client.close()
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

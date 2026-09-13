@@ -1,0 +1,1640 @@
+diff --git a/backend/server.py b/backend/server.py
+index f722ca7..aa4bf75 100644
+--- a/backend/server.py
++++ b/backend/server.py
+@@ -11,6 +11,8 @@ from motor.motor_asyncio import AsyncIOMotorClient
+ import os, io, uuid, logging, re, requests
+ from pathlib import Path
+ from pydantic import BaseModel, Field
++from typing import Literal
++
+ from typing import List, Optional, Any
+ from datetime import datetime, timezone, timedelta
+ from supabase import create_client, Client
+@@ -314,6 +316,55 @@ def fetch_youtube_stats(url: str):
+         logger.warning(f"YouTube fetch failed: {e}")
+         return None
+ 
++def fetch_youtube_stats_batch(video_ids: list[str]) -> tuple[dict[str, dict], bool]:
++    if not video_ids:
++        return {}, True
++    
++    video_ids = video_ids[:50]
++    
++    if not YOUTUBE_API_KEY:
++        res = {}
++        for vid in video_ids:
++            res[vid] = {
++                "video_id": vid,
++                "title": f"Mock Video {vid}",
++                "channel_id": "UCcmV1rN_n79xld1cPti4QUA",
++                "channel_title": "Dhruv Bangera",
++                "views": 1500,
++                "likes": 120,
++                "comments": 15,
++                "published_at": "2026-06-10T12:00:00Z"
++            }
++        return res, True
++        
++    try:
++        ids_str = ",".join(video_ids)
++        r = requests.get("https://www.googleapis.com/youtube/v3/videos",
++                         params={"id": ids_str, "part": "statistics,snippet", "key": YOUTUBE_API_KEY},
++                         timeout=15)
++        r.raise_for_status()
++        items = r.json().get("items", [])
++        
++        res = {}
++        for item in items:
++            vid = item.get("id")
++            s = item.get("statistics", {})
++            sn = item.get("snippet", {})
++            res[vid] = {
++                "video_id": vid,
++                "title": sn.get("title", ""),
++                "channel_id": sn.get("channelId"),
++                "channel_title": sn.get("channelTitle"),
++                "views": int(s.get("viewCount", 0)),
++                "likes": int(s.get("likeCount", 0)),
++                "comments": int(s.get("commentCount", 0)),
++                "published_at": sn.get("publishedAt"),
++            }
++        return res, True
++    except Exception as e:
++        logger.warning(f"YouTube batch fetch failed: {e}")
++        return {}, False
++
+ # ---------------- Auth ----------------
+ async def get_current_user(request: Request,
+                            session_token: Optional[str] = Cookie(None),
+@@ -377,6 +428,7 @@ class FeaturedClipIn(BaseModel):
+     platform: str  # YOUTUBE_SHORTS | TIKTOK | INSTAGRAM_REELS
+     views: int = 0
+     points: float = 0
++    ocv: Optional[float] = 0.0
+     thumbnail_url: Optional[str] = None
+     video_url: Optional[str] = None
+ 
+@@ -396,12 +448,30 @@ class CampaignStatusIn(BaseModel):
+ class WithdrawalStatusIn(BaseModel):
+     status: str
+ 
++class PublishCampaignIn(BaseModel):
++    payment_method: str = "BANK_TRANSFER"
++    payment_reference: str
++
++class FundingDecisionIn(BaseModel):
++    decision: Literal["APPROVE", "REJECT"]
++
++class PayEditorIn(BaseModel):
++    payment_reference: str
++
++class BankDetailsIn(BaseModel):
++    payout_method: str = "UPI"  # UPI | BANK
++    upi_id: Optional[str] = None
++    bank_name: Optional[str] = None
++    bank_account_number: Optional[str] = None
++    bank_account_name: Optional[str] = None
++    bank_ifsc: Optional[str] = None
++
+ class CreateCampaignIn(BaseModel):
+     title: str
+     content_type: str
+     description: str
+     clip_guidelines: str = ""
+-    bounty_pool: float
++    bounty_pool: float = Field(..., ge=1000.0)
+     max_clips_per_editor: int = 10
+     start_date: str
+     end_date: str
+@@ -605,6 +675,7 @@ async def compute_badges(user_id: str):
+         supabase.table("clips")
+         .select("*")
+         .eq("editor_id", user_id)
++        .eq("is_deleted", False)
+         .execute()
+     )
+     clips = clips_resp.data if hasattr(clips_resp, "data") else clips_resp.get("data", [])
+@@ -681,151 +752,131 @@ async def profile_by_username(username: str):
+     return public_profile
+ 
+ 
+-# ---------------- Upload ----------------
+-@api.post("/wallet/cashout")
+-async def cashout(
+-    payload: CashoutIn,
+-    request: Request,
+-    session_token: Optional[str] = Cookie(None),
+-    authorization: Optional[str] = Header(None),
+-):
+-    """MOCK cashout — debits the user's `total_earnings` and creates a withdrawal record.
+-    """
+-    user = await get_current_user(request, session_token, authorization)
+-
+-    amt = float(payload.amount)
+-    if amt <= 0:
+-        raise HTTPException(400, "Amount must be > 0")
++# ---------------- Earnings & Payouts ----------------
+ 
+-    bal = float(user.get("wallet_balance", 0))
+-    if amt > bal:
+-        raise HTTPException(
+-            400, f"Insufficient balance. Available: ₹{bal:.2f}"
+-        )
+-
+-    # ---- Update the user's balance (non‑atomic) ----
+-    new_balance = round(bal - amt, 2)
+-    supabase.table("users").update(
+-        {"wallet_balance": new_balance}
+-    ).eq("user_id", user["user_id"]).execute()
+-
+-    # ---- Record the withdrawal ----
+-    rec = {
+-        "request_id": new_id("wd"),
+-        "user_id": user["user_id"],
+-        "amount": round(amt, 2),
+-        "status": "PENDING",
+-        "created_at": now_iso(),
+-    }
+-    rec["completed_at"] = None
+-    supabase.table("withdrawals").insert(rec).execute()
+-
+-    return {
+-        "ok": True,
+-        "withdrawal_request": clean_doc(rec),
+-        "remaining_balance": new_balance,
+-    }
+-
+-
+-@api.get("/wallet/withdrawals")
+-async def list_withdrawals(
++@api.get("/earnings")
++async def get_earnings(
+     request: Request,
+     session_token: Optional[str] = Cookie(None),
+-    authorization: Optional[str] = Header(None),
++    authorization: Optional[str] = Header(None)
+ ):
+-    """
+-    List the current user's withdrawal records.
+-    Replaces the MongoDB `find` + `sort` call with a Supabase query.
+-    """
+     user = await get_current_user(request, session_token, authorization)
+-    # Retrieve withdrawals for the user, most recent first, limit to 200
+-    resp = (
+-        supabase.table("withdrawals")
+-        .select("*")
+-        .eq("user_id", user["user_id"])
+-        .order("created_at", desc=True)
+-        .limit(200)
++    if user.get("role") != "EDITOR":
++        raise HTTPException(403, "Editor account required")
++        
++    # Query all participations for this editor
++    parts_resp = (
++        supabase.table("participations")
++        .select("*, campaign:campaigns(title, status, bounty_pool)")
++        .eq("editor_id", user["user_id"])
+         .execute()
+     )
+-    # Supabase returns a dict with a `data` key containing the rows
+-    docs = resp.data if hasattr(resp, "data") else resp.get("data", [])
+-    return docs
++    parts = parts_resp.data or []
+ 
+-@api.get("/wallet/transactions")
+-async def wallet_transactions(
+-    request: Request,
+-    session_token: Optional[str] = Cookie(None),
+-    authorization: Optional[str] = Header(None),
+-):
+-    user = await get_current_user(request, session_token, authorization)
+-
+-    resp = (
+-        supabase.table("withdrawals")
+-        .select("*")
+-        .eq("user_id", user["user_id"])
+-        .order("created_at", desc=True)
+-        .limit(200)
++    # Fetch clips to identify empty campaigns (no clips submitted by this editor)
++    clips_resp = (
++        supabase.table("clips")
++        .select("campaign_id")
++        .eq("editor_id", user["user_id"])
++        .eq("is_deleted", False)
+         .execute()
+     )
++    clips = clips_resp.data or []
++    submitted_campaign_ids = {c["campaign_id"] for c in clips if c.get("campaign_id")}
+ 
+-    withdrawals = resp.data or []
+-
+-    transactions = []
+-
+-    for w in withdrawals:
+-        transactions.append({
+-            "id": w["request_id"],
+-            "tx_id": w["request_id"],
+-            "type": "WITHDRAWAL",
+-            "amount": w["amount"],
+-            "status": w["status"],
+-            "created_at": w["created_at"],
++    # Filter parts according to specifications:
++    # 1. Remove all payout history entries where: payout_amount = 0 AND payout_status = 'NONE'
++    # 2. Do not render empty campaigns as payout records (i.e., editor submitted 0 clips)
++    filtered_parts = []
++    for p in parts:
++        payout_amt = float(p.get("payout_amount") or 0.0)
++        payout_status = p.get("payout_status") or "NONE"
++        if payout_amt == 0.0 and payout_status == "NONE":
++            continue
++        if p.get("campaign_id") not in submitted_campaign_ids:
++            continue
++        filtered_parts.append(p)
++    
++    # Calculate totals
++    paid_earnings = sum(float(p.get("payout_amount") or 0.0) for p in filtered_parts if p.get("payout_status") == "PAID")
++    pending_earnings = sum(float(p.get("payout_amount") or 0.0) for p in filtered_parts if p.get("payout_status") == "AWAITING_PAYMENT")
++    
++    history = []
++    for p in filtered_parts:
++        camp = p.get("campaign") or {}
++        history.append({
++            "participation_id": p["participation_id"],
++            "campaign_id": p["campaign_id"],
++            "campaign_title": camp.get("title", "Unknown Campaign"),
++            "campaign_status": camp.get("status", "Unknown Status"),
++            "bounty_pool": camp.get("bounty_pool", 0.0),
++            "payout_amount": p["payout_amount"],
++            "payout_status": p["payout_status"],
++            "payment_reference": p.get("payment_reference"),
++            "paid_at": p.get("paid_at")
+         })
++        
++    return {
++        "paid_earnings": round(paid_earnings, 2),
++        "pending_earnings": round(pending_earnings, 2),
++        "payout_method": user.get("payout_method") or "UPI",
++        "upi_id": user.get("upi_id"),
++        "bank_name": user.get("bank_name"),
++        "bank_account_number": user.get("bank_account_number"),
++        "bank_account_name": user.get("bank_account_name"),
++        "bank_ifsc": user.get("bank_ifsc"),
++        "bank_details": {
++            "payout_method": user.get("payout_method") or "UPI",
++            "upi_id": user.get("upi_id"),
++            "bank_name": user.get("bank_name"),
++            "bank_account_number": user.get("bank_account_number"),
++            "bank_account_name": user.get("bank_account_name"),
++            "bank_ifsc": user.get("bank_ifsc")
++        },
++        "history": history
++    }
++
+ 
+-    return transactions
+ 
+-@api.get("/wallet/creator-summary")
+-async def creator_wallet_summary(
++@api.post("/profile/bank-details")
++async def save_bank_details(
++    payload: BankDetailsIn,
+     request: Request,
+     session_token: Optional[str] = Cookie(None),
+-    authorization: Optional[str] = Header(None),
++    authorization: Optional[str] = Header(None)
+ ):
+     user = await get_current_user(request, session_token, authorization)
+-
+-    if user.get("role") != "CREATOR":
+-        raise HTTPException(403, "Creator account required")
+-
+-    camps_resp = (
+-        supabase.table("campaigns")
+-        .select("*")
+-        .eq("creator_id", user["user_id"])
+-        .execute()
+-    )
+-
+-    campaigns = camps_resp.data or []
+-
+-    total_spent = sum(float(c.get("bounty_pool", 0)) for c in campaigns)
+-    pending_payment = sum(
+-        float(c.get("bounty_pool", 0))
+-        for c in campaigns
+-        if c.get("status") == "PENDING_PAYMENT"
+-    )
+-    active_budget = sum(
+-        float(c.get("bounty_pool", 0))
+-        for c in campaigns
+-        if c.get("status") == "ACTIVE"
+-    )
+-
+-    return {
+-        "balance": 0.0,
+-        "available_balance": 0.0,
+-        "total_spent": total_spent,
+-        "total_spend": total_spent,
+-        "pending_payment": pending_payment,
+-        "in_escrow": active_budget,
+-        "pending_payouts": 0.0,
+-        "campaigns_created": len(campaigns),
++    await require_role(user, "EDITOR")
++    
++    p_method = (payload.payout_method or "UPI").upper()
++    if p_method not in ("UPI", "BANK"):
++        raise HTTPException(400, "Invalid payout_method. Must be 'UPI' or 'BANK'.")
++        
++    if p_method == "UPI":
++        if not payload.upi_id or not payload.upi_id.strip():
++            raise HTTPException(400, "UPI ID is required when payout method is UPI.")
++    else: # BANK
++        if not payload.bank_name or not payload.bank_name.strip():
++            raise HTTPException(400, "Bank name is required when payout method is BANK.")
++        if not payload.bank_account_number or not payload.bank_account_number.strip():
++            raise HTTPException(400, "Bank account number is required when payout method is BANK.")
++        if not payload.bank_account_name or not payload.bank_account_name.strip():
++            raise HTTPException(400, "Account holder name is required when payout method is BANK.")
++        if not payload.bank_ifsc or not payload.bank_ifsc.strip():
++            raise HTTPException(400, "Bank IFSC is required when payout method is BANK.")
++            
++    upd = {
++        "payout_method": p_method,
++        "upi_id": payload.upi_id,
++        "bank_name": payload.bank_name,
++        "bank_account_number": payload.bank_account_number,
++        "bank_account_name": payload.bank_account_name,
++        "bank_ifsc": payload.bank_ifsc
+     }
++    
++    supabase.table("users").update(upd).eq("user_id", user["user_id"]).execute()
++    return {"ok": True, "bank_details": upd}
++
+ 
+ 
+ 
+@@ -922,6 +973,15 @@ async def list_campaigns(
+     query = supabase.table("campaigns").select("*")
+ 
+     if status:
++        if status in ("DRAFT", "AWAITING_FUNDING"):
++            user_role = None
++            try:
++                user = await get_current_user(request, session_token, authorization)
++                user_role = user.get("role")
++            except Exception:
++                pass
++            if user_role not in ("ADMIN", "CREATOR"):
++                raise HTTPException(403, "Access denied")
+         query = query.eq("status", status)
+ 
+     if content_type:
+@@ -960,6 +1020,32 @@ async def list_campaigns(
+     result = query.execute()
+     docs = result.data or []
+ 
++    # Enforce role-based security rules on the result set
++    caller_id = None
++    caller_role = None
++    try:
++        user = await get_current_user(request, session_token, authorization)
++        caller_id = user.get("user_id")
++        caller_role = user.get("role")
++    except Exception:
++        pass
++
++    filtered_docs = []
++    for d in docs:
++        d_status = d.get("status")
++        d_creator_id = d.get("creator_id")
++        if d_status in ("DRAFT", "AWAITING_FUNDING"):
++            if caller_role == "ADMIN" or (caller_role == "CREATOR" and caller_id == d_creator_id):
++                filtered_docs.append(d)
++        else:
++            if caller_role == "EDITOR" or not caller_role:
++                if d_status in ("ACTIVE", "SETTLING", "COMPLETED"):
++                    filtered_docs.append(d)
++            else:
++                filtered_docs.append(d)
++    docs = filtered_docs
++
++
+     for d in docs:
+         creator_result = (
+             supabase.table("users")
+@@ -984,6 +1070,18 @@ async def list_campaigns(
+ 
+         d["participant_count"] = len(participants.data or [])
+ 
++        # Dynamic total_ocv calculation
++        c_clips_resp = (
++            supabase.table("clips")
++            .select("ocv")
++            .eq("campaign_id", d["campaign_id"])
++            .eq("is_deleted", False)
++            .limit(10000)
++            .execute()
++        )
++        c_clips = c_clips_resp.data or []
++        d["total_ocv"] = round(sum(float(c.get("ocv") or 0.0) for c in c_clips), 2)
++
+     return docs
+ 
+ @api.get("/campaigns/{campaign_id}")
+@@ -1004,6 +1102,25 @@ async def get_campaign(
+     campaign = resp.data if hasattr(resp, "data") else resp.get("data")
+     if not campaign:
+         raise HTTPException(404, "Campaign not found")
++
++    caller_id = None
++    caller_role = None
++    try:
++        user = await get_current_user(request, session_token, authorization)
++        caller_id = user.get("user_id")
++        caller_role = user.get("role")
++    except Exception:
++        pass
++
++    status = campaign.get("status", "DRAFT")
++    if status in ("DRAFT", "AWAITING_FUNDING"):
++        if caller_role != "ADMIN" and (caller_role != "CREATOR" or caller_id != campaign.get("creator_id")):
++            raise HTTPException(403, "Access denied")
++    else:
++        if caller_role == "EDITOR" or not caller_role:
++            if status not in ("ACTIVE", "SETTLING", "COMPLETED"):
++                raise HTTPException(403, "Access denied")
++
+     creator_resp = (
+         supabase.table("users")
+         .select("user_id,name,avatar_url,username")
+@@ -1019,6 +1136,19 @@ async def get_campaign(
+         .execute()
+     )
+     campaign["participant_count"] = len(participants.data or [])
++
++    # Dynamic total_ocv calculation for single campaign
++    c_clips_resp = (
++        supabase.table("clips")
++        .select("ocv")
++        .eq("campaign_id", campaign_id)
++        .eq("is_deleted", False)
++        .limit(10000)
++        .execute()
++    )
++    c_clips = c_clips_resp.data or []
++    campaign["total_ocv"] = round(sum(float(c.get("ocv") or 0.0) for c in c_clips), 2)
++
+     return clean_doc(campaign)
+ 
+ @api.post("/campaigns")
+@@ -1033,6 +1163,9 @@ async def create_campaign(
+         print("=== ACTIVE CREATE ROUTE ===")
+         user = await get_current_user(request, session_token, authorization)
+         await require_role(user, "CREATOR")
++        # Validate minimum budget (₹1000)
++        if payload.bounty_pool < 1000:
++            raise HTTPException(400, "Campaign budget must be at least ₹1000")
+         # Build campaign dict matching Supabase schema
+         campaign = {
+             "campaign_id": new_id("camp"),
+@@ -1053,29 +1186,9 @@ async def create_campaign(
+             "source_video_urls": payload.source_video_urls,
+             "status": "DRAFT",
+             "created_at": now_iso(),
+-        }
+-        full_campaign = {
+-            "campaign_id": new_id("camp"),
+-            "creator_id": user["user_id"],
+-            "title": payload.title,
+-            "content_type": payload.content_type,
+-            "description": payload.description,
+-            "brief": payload.brief,
+-            "assets": payload.assets,
+-            "bounty_pool": payload.bounty_pool,
+-            "max_clips_per_editor": payload.max_clips_per_editor,
+-            "start_date": payload.start_date,
+-            "end_date": payload.end_date,
+-            "editor_pool_pct": payload.editor_pool_pct,
+-            "performance_pool_pct": payload.performance_pool_pct,
+-            "bonus_pool_pct": payload.bonus_pool_pct,
+-            "min_duration_days": payload.min_duration_days,
+-            # Preserve possible legacy field; will be filtered out if not in schema
+-            "early_close_penalty_pct": getattr(payload, "early_close_penalty_pct", None),
+-            "clip_guidelines": payload.clip_guidelines,
+-            "source_video_urls": payload.source_video_urls,
+-            "status": "DRAFT",
+-            "created_at": now_iso(),
++            "escrow_funded": False,
++            "funding_status": "UNFUNDED",
++            "funding_reference": None
+         }
+ 
+         # Insert the campaign using the already built schema‑matched dict
+@@ -1089,6 +1202,7 @@ async def create_campaign(
+ @api.post("/campaigns/{campaign_id}/publish")
+ async def publish_campaign(
+     campaign_id: str,
++    payload: PublishCampaignIn,
+     request: Request,
+     session_token: Optional[str] = Cookie(None),
+     authorization: Optional[str] = Header(None)
+@@ -1107,8 +1221,19 @@ async def publish_campaign(
+         raise HTTPException(404, "Campaign not found")
+     if campaign.get("creator_id") != user.get("user_id"):
+         raise HTTPException(403, "Only the creator can publish this campaign")
+-    supabase.table("campaigns").update({"status": "PENDING_PAYMENT"}).eq("campaign_id", campaign_id).execute()
+-    return {"ok": True, "campaign_id": campaign_id, "status": "PENDING_PAYMENT"}
++    
++    if not payload.payment_reference or not payload.payment_reference.strip():
++        raise HTTPException(
++            status_code=400,
++            detail="Payment reference (UTR) is required to publish campaign"
++        )
++
++    upd = {
++        "status": "AWAITING_FUNDING",
++        "funding_status": "AWAITING_VERIFICATION",
++        "funding_reference": payload.payment_reference.strip(),
++        "published_at": now_iso()
++}
+ 
+ async def complete_campaign_and_credit_wallets(campaign_id: str) -> dict:
+     camp_resp = (
+@@ -1121,13 +1246,14 @@ async def complete_campaign_and_credit_wallets(campaign_id: str) -> dict:
+     campaign = camp_resp.data
+     if not campaign:
+         raise HTTPException(404, "Campaign not found")
+-    if campaign.get("status") == "COMPLETED":
+-        raise HTTPException(400, "Campaign already completed")
++    if campaign.get("status") in ("SETTLING", "COMPLETED"):
++        raise HTTPException(400, "Campaign already settling or completed")
+ 
+     clips_resp = (
+         supabase.table("clips")
+         .select("editor_id,ocv")
+         .eq("campaign_id", campaign_id)
++        .eq("is_deleted", False)
+         .limit(10000)
+         .execute()
+     )
+@@ -1147,55 +1273,65 @@ async def complete_campaign_and_credit_wallets(campaign_id: str) -> dict:
+ 
+     for editor_id, ocv in editor_ocv.items():
+         amount = round((ocv / total_campaign_ocv) * reward_pool, 2) if total_campaign_ocv > 0 else 0.0
+-        user_resp = (
+-            supabase.table("users")
+-            .select("wallet_balance,total_earnings")
+-            .eq("user_id", editor_id)
+-            .single()
+-            .execute()
+-        )
+-        editor = user_resp.data or {}
+-        wallet_balance = round(float(editor.get("wallet_balance") or 0.0) + amount, 2)
+-        total_earnings = round(float(editor.get("total_earnings") or 0.0) + amount, 2)
+-        supabase.table("users").update({
+-            "wallet_balance": wallet_balance,
+-            "total_earnings": total_earnings,
+-        }).eq("user_id", editor_id).execute()
++        
++        # Update participation record with payout info and status
+         supabase.table("participations").update({
+             "payout_amount": amount,
+-            "payout_status": "EARNED",
++            "payout_status": "AWAITING_PAYMENT",
+         }).eq("campaign_id", campaign_id).eq("editor_id", editor_id).execute()
++        
+         payouts.append({
+             "editor_id": editor_id,
+             "editor_ocv": round(ocv, 2),
+             "amount": amount,
+         })
+ 
++    # Create settlement log entry
++    settlement_id = new_id("set")
++    supabase.table("settlement_logs").insert({
++        "settlement_id": settlement_id,
++        "campaign_id": campaign_id,
++        "total_ocv": round(total_campaign_ocv, 2),
++        "bounty_pool": float(campaign.get("bounty_pool") or 0.0),
++        "net_pool": reward_pool,
++        "platform_fee": round(float(campaign.get("bounty_pool") or 0.0) * 0.15, 2),
++        "payouts": payouts,
++        "created_at": now_iso()
++    }).execute()
++
++    # Update campaign status to SETTLING
+     supabase.table("campaigns").update({
+-        "status": "COMPLETED",
+-        "completed_at": now_iso(),
++        "status": "SETTLING",
+     }).eq("campaign_id", campaign_id).execute()
+ 
+     return {
+         "ok": True,
+         "campaign_id": campaign_id,
+-        "status": "COMPLETED",
++        "status": "SETTLING",
+         "reward_pool": reward_pool,
+         "total_campaign_ocv": round(total_campaign_ocv, 2),
+         "payouts": payouts,
+     }
+ 
+-@api.post("/campaigns/{campaign_id}/approve-payout")
+-async def approve_payout(
++
++@api.post("/admin/campaigns/{campaign_id}/status")
++async def admin_set_campaign_status(
+     campaign_id: str,
++    payload: CampaignStatusIn,
+     request: Request,
+     session_token: Optional[str] = Cookie(None),
+     authorization: Optional[str] = Header(None)
+ ):
+     user = await get_current_user(request, session_token, authorization)
++    await require_role(user, "ADMIN")
++    status = payload.status.upper()
++    allowed = {"DRAFT", "AWAITING_FUNDING", "ACTIVE", "SETTLING", "COMPLETED", "CANCELLED"}
++    if status not in allowed:
++        raise HTTPException(400, "Invalid campaign status")
++        
+     camp_resp = (
+         supabase.table("campaigns")
+-        .select("creator_id")
++        .select("*")
+         .eq("campaign_id", campaign_id)
+         .single()
+         .execute()
+@@ -1203,28 +1339,75 @@ async def approve_payout(
+     campaign = camp_resp.data
+     if not campaign:
+         raise HTTPException(404, "Campaign not found")
+-    if campaign.get("creator_id") != user.get("user_id") and user.get("role") != "ADMIN":
+-        raise HTTPException(403, "Only the creator or admin can complete this campaign")
+-    return await complete_campaign_and_credit_wallets(campaign_id)
++        
++    if status == "ACTIVE" and not campaign.get("escrow_funded"):
++        raise HTTPException(400, "Campaign must be escrow_funded to be ACTIVE")
++        
++    if status == "COMPLETED":
++        return await complete_campaign_and_credit_wallets(campaign_id)
++        
++    supabase.table("campaigns").update({"status": status}).eq("campaign_id", campaign_id).execute()
++    return {"ok": True, "campaign_id": campaign_id, "status": status}
+ 
+-@api.post("/admin/campaigns/{campaign_id}/status")
+-async def admin_set_campaign_status(
++
++@api.post("/admin/campaigns/{campaign_id}/start-settlement")
++async def start_settlement(
+     campaign_id: str,
+-    payload: CampaignStatusIn,
+     request: Request,
+     session_token: Optional[str] = Cookie(None),
+     authorization: Optional[str] = Header(None)
+ ):
+     user = await get_current_user(request, session_token, authorization)
+     await require_role(user, "ADMIN")
+-    status = payload.status.upper()
+-    allowed = {"DRAFT", "PENDING_PAYMENT", "ACTIVE", "COMPLETED"}
+-    if status not in allowed:
+-        raise HTTPException(400, "Invalid campaign status")
+-    if status == "COMPLETED":
+-        return await complete_campaign_and_credit_wallets(campaign_id)
+-    supabase.table("campaigns").update({"status": status}).eq("campaign_id", campaign_id).execute()
+-    return {"ok": True, "campaign_id": campaign_id, "status": status}
++    return await complete_campaign_and_credit_wallets(campaign_id)
++
++@api.post("/admin/participations/{participation_id}/pay")
++async def pay_editor(
++    participation_id: str,
++    payload: PayEditorIn,
++    request: Request,
++    session_token: Optional[str] = Cookie(None),
++    authorization: Optional[str] = Header(None)
++):
++    user = await get_current_user(request, session_token, authorization)
++    await require_role(user, "ADMIN")
++    
++    part_resp = (
++        supabase.table("participations")
++        .select("*")
++        .eq("participation_id", participation_id)
++        .single()
++        .execute()
++    )
++    part = part_resp.data
++    if not part:
++        raise HTTPException(404, "Participation not found")
++        
++    upd = {
++        "payout_status": "PAID",
++        "payment_reference": payload.payment_reference,
++        "paid_at": now_iso()
++    }
++    supabase.table("participations").update(upd).eq("participation_id", participation_id).execute()
++    
++    # Check if all other participants for this campaign are paid
++    camp_id = part["campaign_id"]
++    parts_resp = (
++        supabase.table("participations")
++        .select("payout_status")
++        .eq("campaign_id", camp_id)
++        .execute()
++    )
++    all_parts = parts_resp.data or []
++    
++    # If all participants who have clips/earnings are paid, mark campaign completed
++    if all(p.get("payout_status") == "PAID" for p in all_parts if float(p.get("payout_amount") or 0) > 0):
++        supabase.table("campaigns").update({
++            "status": "COMPLETED",
++            "completed_at": now_iso()
++        }).eq("campaign_id", camp_id).execute()
++        
++    return {"ok": True, "participation_id": participation_id, "payout_status": "PAID"}
+ 
+ @api.get("/admin/withdrawal-requests")
+ async def admin_list_withdrawal_requests(
+@@ -1302,18 +1485,148 @@ async def admin_set_withdrawal_status(
+ 
+ 
+ 
++# ------------------------------------------------------------
++# Admin Funding Queue
++# ------------------------------------------------------------
++@api.get("/admin/funding-queue")
++async def admin_funding_queue(
++    request: Request,
++    session_token: Optional[str] = Cookie(None),
++    authorization: Optional[str] = Header(None)
++):
++    """Return campaigns awaiting funding (ADMIN only)."""
++    user = await get_current_user(request, session_token, authorization)
++    await require_role(user, "ADMIN")
++    resp = (
++        supabase.table("campaigns")
++        .select("campaign_id,title,creator_id,bounty_pool,funding_reference,created_at,status")
++        .eq("status", "AWAITING_FUNDING")
++        .execute()
++    )
++    campaigns = resp.data or []
++    enriched = []
++    for c in campaigns:
++        creator_resp = (
++            supabase.table("users")
++            .select("name")
++            .eq("user_id", c.get("creator_id"))
++            .single()
++            .execute()
++        )
++        creator_name = creator_resp.data.get("name") if creator_resp.data else None
++        enriched.append({
++            "campaign_id": c.get("campaign_id"),
++            "title": c.get("title"),
++            "creator_id": c.get("creator_id"),
++            "creator_name": creator_name,
++            "bounty_pool": c.get("bounty_pool"),
++            "funding_reference": c.get("funding_reference"),
++            "created_at": c.get("created_at"),
++            "funding_status": c.get("status"),
++        })
++    return enriched
++
++# ------------------------------------------------------------
++# Admin Funding Decision Endpoint
++# ------------------------------------------------------------
++
++@api.post("/admin/campaigns/{campaign_id}/funding-decision")
++async def admin_funding_decision(
++    campaign_id: str,
++    payload: FundingDecisionIn,
++    request: Request,
++    session_token: Optional[str] = Cookie(None),
++    authorization: Optional[str] = Header(None),
++):
++    """Admin approves or rejects a campaign's funding.
++    APPROVE -> escrow_funded=True, funding_status="FUNDED"
++    REJECT -> funding_status="REJECTED", status="DRAFT"
++    """
++    user = await get_current_user(request, session_token, authorization)
++    await require_role(user, "ADMIN")
++    # Load campaign
++    camp_resp = (
++        supabase.table("campaigns")
++        .select("*")
++        .eq("campaign_id", campaign_id)
++        .single()
++        .execute()
++    )
++    campaign = camp_resp.data if hasattr(camp_resp, "data") else camp_resp.get("data")
++    if not campaign:
++        raise HTTPException(404, "Campaign not found")
++    if campaign.get("status") != "AWAITING_FUNDING":
++        raise HTTPException(400, "Campaign not awaiting funding")
++    if payload.decision == "APPROVE":
++        upd = {"escrow_funded": True, "funding_status": "FUNDED"}
++    else:
++        upd = {"funding_status": "REJECTED", "status": "DRAFT"}
++    supabase.table("campaigns").update(upd).eq("campaign_id", campaign_id).execute()
++    return {"ok": True, "campaign_id": campaign_id, "decision": payload.decision}
++
++
++# ------------------------------------------------------------
++# Admin Settlement Queue
++# ------------------------------------------------------------
++@api.get("/admin/settlement-queue")
++async def admin_settlement_queue(
++    request: Request,
++    session_token: Optional[str] = Cookie(None),
++    authorization: Optional[str] = Header(None)
++):
++    """Return campaigns ready for settlement (ADMIN only)."""
++    user = await get_current_user(request, session_token, authorization)
++    await require_role(user, "ADMIN")
++    resp = (
++        supabase.table("campaigns")
++        .select("campaign_id,title,creator_id,bounty_pool,status")
++        .eq("status", "SETTLING")
++        .execute()
++    )
++    campaigns = resp.data or []
++    enriched = []
++    for c in campaigns:
++        parts_resp = (
++            supabase.table("participations")
++            .select("payout_amount,payout_status")
++            .eq("campaign_id", c.get("campaign_id"))
++            .execute()
++        )
++        parts = parts_resp.data or []
++        unpaid = [p for p in parts if p.get("payout_status") != "PAID"]
++        unpaid_count = len(unpaid)
++        unpaid_amount = round(sum(float(p.get("payout_amount") or 0) for p in unpaid), 2)
++        creator_resp = (
++            supabase.table("users")
++            .select("name")
++            .eq("user_id", c.get("creator_id"))
++            .single()
++            .execute()
++        )
++        creator_name = creator_resp.data.get("name") if creator_resp.data else None
++        enriched.append({
++            "campaign_id": c.get("campaign_id"),
++            "title": c.get("title"),
++            "creator_name": creator_name,
++            "bounty_pool": c.get("bounty_pool"),
++            "status": c.get("status"),
++            "unpaid_count": unpaid_count,
++            "unpaid_amount": unpaid_amount,
++        })
++    return enriched
++
+ # ---------------- Creator Dashboard ----------------
+-def _tier(points: float) -> str:
+-    if points >= 50000: return "DIAMOND"
+-    if points >= 20000: return "PLATINUM"
+-    if points >= 10000: return "GOLD"
+-    if points >= 5000:  return "SILVER"
+-    if points >= 1000:  return "BRONZE"
++def _tier(ocv: float) -> str:
++    if ocv >= 50.0: return "DIAMOND"
++    if ocv >= 20.0: return "PLATINUM"
++    if ocv >= 10.0: return "GOLD"
++    if ocv >= 5.0:  return "SILVER"
++    if ocv >= 1.0:  return "BRONZE"
+     return "ROOKIE"
+ 
+-def _elo(points: float) -> int:
+-    # simple deterministic mapping
+-    return int(1000 + min(points, 50000) * 0.06)
++def _elo(ocv: float) -> int:
++    # simple deterministic mapping based on ocv
++    return int(1000 + min(ocv, 50.0) * 60)
+ 
+ @api.get("/dashboard/creator")
+ async def creator_dashboard(
+@@ -1351,6 +1664,7 @@ async def creator_dashboard(
+         supabase.table("clips")
+         .select("*")
+         .in_("campaign_id", camp_ids)
++        .eq("is_deleted", False)
+         .limit(5000)
+         .execute()
+     )
+@@ -1374,7 +1688,7 @@ async def creator_dashboard(
+     # ------------------------------------------------------------------
+     # 5️⃣  Top performing clips (max 6) with projected editor info
+     # ------------------------------------------------------------------
+-    top_clips = sorted(clips, key=lambda x: x.get("points", 0), reverse=True)[:6]
++    top_clips = sorted(clips, key=lambda x: float(x.get("ocv") or 0.0), reverse=True)[:6]
+     enriched_clips = []
+     for cl in top_clips:
+         editor_resp = (
+@@ -1394,6 +1708,7 @@ async def creator_dashboard(
+                 "retention_pct": cl.get("retention_pct"),
+                 "engagement_pct": cl.get("engagement_pct"),
+                 "points": cl.get("points"),
++                "ocv": float(cl.get("ocv") or 0.0),
+                 "thumbnail": (cl.get("yt_meta") or {}).get("thumbnail"),
+                 "editor": clean_doc(ed) if ed else None,
+             }
+@@ -1406,10 +1721,11 @@ async def creator_dashboard(
+     for cl in clips:
+         agg = by_editor.setdefault(
+             cl["editor_id"],
+-            {"views": 0, "points": 0, "earnings": 0.0, "clips": 0},
++            {"views": 0, "points": 0, "ocv": 0.0, "earnings": 0.0, "clips": 0},
+         )
+         agg["views"] += cl.get("views", 0)
+         agg["points"] += cl.get("points", 0)
++        agg["ocv"] += float(cl.get("ocv") or 0.0)
+         agg["clips"] += 1
+ 
+     # Earnings: fetch all participations for the creator's campaigns
+@@ -1427,7 +1743,7 @@ async def creator_dashboard(
+             by_editor[eid]["earnings"] += float(p.get("payout_amount", 0))
+ 
+     top_editors = sorted(
+-        by_editor.items(), key=lambda x: x[1]["points"], reverse=True
++        by_editor.items(), key=lambda x: x[1]["ocv"], reverse=True
+     )[:6]
+     enriched_editors = []
+     for eid, agg in top_editors:
+@@ -1439,15 +1755,26 @@ async def creator_dashboard(
+             .execute()
+         )
+         ed = editor_resp.data if hasattr(editor_resp, "data") else editor_resp.get("data")
+-        lp = float((ed or {}).get("lifetime_points", 0))
++        # Compute lifetime ocv dynamically
++        user_clips_resp = (
++            supabase.table("clips")
++            .select("ocv")
++            .eq("editor_id", eid)
++            .eq("is_deleted", False)
++            .execute()
++        )
++        all_user_clips = user_clips_resp.data or []
++        lifetime_ocv = sum(float(c.get("ocv") or 0.0) for c in all_user_clips)
++
+         enriched_editors.append(
+             {
+                 "editor": clean_doc(ed) if ed else None,
+                 "views_generated": agg["views"],
+                 "earnings_generated": round(agg["earnings"], 2),
+                 "points": round(agg["points"], 2),
+-                "elo": _elo(lp),
+-                "tier": _tier(lp),
++                "ocv": round(agg["ocv"], 2),
++                "elo": _elo(lifetime_ocv),
++                "tier": _tier(lifetime_ocv),
+             }
+         )
+ 
+@@ -1456,7 +1783,7 @@ async def creator_dashboard(
+     # ------------------------------------------------------------------
+     from collections import defaultdict
+ 
+-    bucket = defaultdict(lambda: {"views": 0, "clips": 0, "points": 0})
++    bucket = defaultdict(lambda: {"views": 0, "clips": 0, "points": 0, "ocv": 0.0})
+     for cl in clips:
+         ts = cl.get("submitted_at", "")
+         if not ts:
+@@ -1467,6 +1794,7 @@ async def creator_dashboard(
+             bucket[key]["views"] += cl.get("views", 0)
+             bucket[key]["clips"] += 1
+             bucket[key]["points"] += cl.get("points", 0)
++            bucket[key]["ocv"] += float(cl.get("ocv") or 0.0)
+         except Exception:
+             pass
+     timeline = [{ "month": k, **v } for k, v in sorted(bucket.items())][-6:]
+@@ -1526,6 +1854,7 @@ async def talent(
+             supabase.table("clips")
+             .select("*")
+             .eq("editor_id", uid)
++            .eq("is_deleted", False)
+             .limit(2000)
+             .execute()
+         )
+@@ -1636,7 +1965,7 @@ async def join_campaign(
+     if not camp:
+         raise HTTPException(404, "DEBUG_CAMPAIGN_NOT_FOUND")
+ 
+-    if camp.get("status") != "ACTIVE":
++    if camp.get("status") != "ACTIVE" or not camp.get("escrow_funded"):
+         raise HTTPException(400, "Campaign not joinable")
+ 
+     # ------------------------------------------------------------------
+@@ -1724,6 +2053,10 @@ async def submit_short(
+ ):
+     # 1️⃣ Auth
+     user = await get_current_user(request, session_token, authorization)
++    await require_role(user, "EDITOR")
++    # Ensure campaign is active and funded
++    if camp.get("status") != "ACTIVE" or not camp.get("escrow_funded"):
++        raise HTTPException(400, "Campaign is not active or not funded for short submission")
+ 
+     # 2️⃣ Verify enrollment
+     part_resp = (
+@@ -1828,39 +2161,41 @@ async def recompute_campaign(campaign_id: str):
+         supabase.table("clips")
+         .select("*")
+         .eq("campaign_id", campaign_id)
++        .eq("is_deleted", False)
+         .limit(10000)
+         .execute()
+     )
+     clips = clips_resp.data if hasattr(clips_resp, "data") else clips_resp.get("data", [])
+ 
+     # ------------------------------------------------------------------
+-    # 2️⃣ Aggregate points per editor and total points
+-    # ------------------------------------------------------------------
+-    editor_totals: dict[str, float] = {}
++    # 2️⃣ Aggregate points and OCV per editor and totals
++    editor_points: dict[str, float] = {}
++    editor_ocv: dict[str, float] = {}
+     total_points: float = 0.0
++    total_ocv: float = 0.0
+     for clip in clips:
+         pts = clip.get("points", 0.0)
++        ocv = float(clip.get("ocv") or 0.0)
+         editor_id = clip.get("editor_id")
+-        editor_totals[editor_id] = editor_totals.get(editor_id, 0.0) + pts
++        editor_points[editor_id] = editor_points.get(editor_id, 0.0) + pts
++        editor_ocv[editor_id] = editor_ocv.get(editor_id, 0.0) + ocv
+         total_points += pts
++        total_ocv += ocv
+ 
+-    # ------------------------------------------------------------------
+     # 3️⃣ Update the campaign's total_points field
+-    # ------------------------------------------------------------------
+     supabase.table("campaigns") \
+         .update({"total_points": round(total_points, 2)}) \
+         .eq("campaign_id", campaign_id) \
+         .execute()
+ 
+-    # ------------------------------------------------------------------
+-    # 4️⃣ Sort editors by points and write participation updates
+-    # ------------------------------------------------------------------
+-    sorted_parts = sorted(editor_totals.items(), key=lambda x: x[1], reverse=True)
+-    for rank, (editor_id, pts) in enumerate(sorted_parts, start=1):
+-        share_pct = (pts / total_points * 100) if total_points > 0 else 0.0
++    # 4️⃣ Sort editors by campaign OCV (descending) to assign rank and share percentage
++    sorted_parts = sorted(editor_ocv.items(), key=lambda x: x[1], reverse=True)
++    for rank, (editor_id, ed_ocv) in enumerate(sorted_parts, start=1):
++        share_pct = (ed_ocv / total_ocv * 100) if total_ocv > 0 else 0.0
++        pts = editor_points.get(editor_id, 0.0)
+         supabase.table("participations") \
+             .update({
+-                "total_points": round(pts, 2),
++                "total_points": round(pts, 2), # Maintain DB column compatibility
+                 "rank": rank,
+                 "reward_share_pct": round(share_pct, 2),
+             }) \
+@@ -1899,7 +2234,7 @@ async def submit_clip(
+     c = campaign_resp.data
+     if not c:
+         raise HTTPException(404, "Campaign not found")
+-    if c["status"] != "ACTIVE":
++    if c["status"] != "ACTIVE" or not c.get("escrow_funded"):
+         raise HTTPException(400, "Campaign not accepting clips")
+ 
+     # ------------------------------------------------------------------
+@@ -2006,6 +2341,8 @@ async def submit_clip(
+         "channel_id": clip_channel_id,
+         "title": yt_meta.get("title"),
+         "channel_name": yt_meta.get("channel_title"),
++        "is_deleted": False,
++        "deleted_at": None,
+     }
+ 
+     # ------------------------------------------------------------------
+@@ -2027,6 +2364,7 @@ async def submit_clip(
+         supabase.table("clips")
+         .select("points")
+         .eq("editor_id", user["user_id"])
++        .eq("is_deleted", False)
+         .execute()
+     )
+     for cl in clips_resp.data or []:
+@@ -2096,6 +2434,7 @@ async def build_public_profile(user: dict):
+         supabase.table("clips")
+         .select("*")
+         .eq("editor_id", uid)
++        .eq("is_deleted", False)
+         .limit(2000)
+         .execute()
+     )
+@@ -2133,12 +2472,15 @@ async def build_public_profile(user: dict):
+         c = campaigns_map.get(cid)
+         if not c:
+             continue
++        # Calculate OCV for this campaign
++        camp_ocv = sum(float(cl.get("ocv") or 0.0) for cl in clips if cl.get("campaign_id") == cid)
+         history.append({
+             "campaign_id": c["campaign_id"],
+             "title": c["title"],
+             "status": c["status"],
+             "rank": p.get("rank"),
+             "points": p.get("total_points", 0),
++            "ocv": round(camp_ocv, 2),
+             "payout": p.get("payout_amount", 0),
+         })
+     history.sort(key=lambda x: (x.get("rank") or 999))
+@@ -2163,7 +2505,22 @@ async def build_public_profile(user: dict):
+ 
+ # ---------------- Leaderboard ----------------
+ @api.get("/leaderboard/campaign/{campaign_id}")
+-async def leaderboard_campaign(campaign_id: str):
++async def leaderboard_campaign(
++    campaign_id: str,
++    request: Request,
++    session_token: Optional[str] = Cookie(None),
++    authorization: Optional[str] = Header(None)
++):
++    # -------------------------------------------------
++    # Check if user is Admin for bank details access
++    # -------------------------------------------------
++    is_admin = False
++    try:
++        current_user = await get_current_user(request, session_token, authorization)
++        is_admin = current_user.get("role") == "ADMIN"
++    except Exception:
++        pass
++
+     # -------------------------------------------------
+     # 1️⃣  Fetch all participations for the campaign,
+     #    ordered by total points (descending).
+@@ -2190,13 +2547,13 @@ async def leaderboard_campaign(campaign_id: str):
+     )
+     camp = camp_resp.data if hasattr(camp_resp, "data") else camp_resp.get("data")
+     pool_net = (camp["bounty_pool"] * (1 - PLATFORM_FEE / 100.0)) if camp else 0.0
+-    total = camp.get("total_points", 0.0) if camp else 0.0
+ 
+     # Fetch all clips in this campaign to sum the total campaign OCV
+     all_clips_resp = (
+         supabase.table("clips")
+         .select("ocv")
+         .eq("campaign_id", campaign_id)
++        .eq("is_deleted", False)
+         .limit(10000)
+         .execute()
+     )
+@@ -2211,17 +2568,38 @@ async def leaderboard_campaign(campaign_id: str):
+         # Editor (user) info
+         editor_resp = (
+             supabase.table("users")
+-            .select("user_id,name,username,avatar_url")
++            .select("user_id,name,username,avatar_url,payout_method,upi_id,bank_name,bank_account_number,bank_account_name,bank_ifsc")
+             .eq("user_id", p["editor_id"]).single()
+             .execute()
+         )
+         editor = editor_resp.data if hasattr(editor_resp, "data") else editor_resp.get("data")
++        
++        # Strip bank details if not admin, pack into dictionary if admin
++        if editor:
++            if is_admin:
++                editor["bank_details"] = {
++                    "payout_method": editor.get("payout_method") or "UPI",
++                    "upi_id": editor.get("upi_id"),
++                    "bank_name": editor.get("bank_name"),
++                    "bank_account_number": editor.get("bank_account_number"),
++                    "bank_account_name": editor.get("bank_account_name"),
++                    "bank_ifsc": editor.get("bank_ifsc")
++                }
++            else:
++                editor.pop("payout_method", None)
++                editor.pop("upi_id", None)
++                editor.pop("bank_name", None)
++                editor.pop("bank_account_number", None)
++                editor.pop("bank_account_name", None)
++                editor.pop("bank_ifsc", None)
++
+         # Clips submitted by this editor in this campaign
+         clips_resp = (
+             supabase.table("clips")
+             .select("points,views,ocv")
+             .eq("campaign_id", campaign_id)
+             .eq("editor_id", p["editor_id"])
++            .eq("is_deleted", False)
+             .limit(100)
+             .execute()
+         )
+@@ -2243,6 +2621,11 @@ async def leaderboard_campaign(campaign_id: str):
+                 "best_clip": {"points": best["points"], "views": best["views"]} if best else None,
+                 "reward_share_pct": round(share * 100, 2),
+                 "projected_payout": round(pool_net * share, 2),
++                "participation_id": p.get("participation_id"),
++                "payout_status": p.get("payout_status"),
++                "payout_amount": p.get("payout_amount"),
++                "payment_reference": p.get("payment_reference"),
++                "paid_at": p.get("paid_at")
+             }
+         )
+ 
+@@ -2257,33 +2640,54 @@ async def leaderboard_campaign(campaign_id: str):
+ 
+ @api.get("/leaderboard/lifetime")
+ async def leaderboard_lifetime(limit: int = 25):
+-    """Lifetime editor leaderboard – ordered by `lifetime_points` descending.
+-    Returns rank, a cleaned `editor` object, `lifetime_points`, and
++    """Lifetime editor leaderboard – ordered by lifetime OCV descending.
++    Returns rank, a cleaned `editor` object, `lifetime_points`, `lifetime_ocv`, and
+     `total_earnings` for each editor.
+     """
+-    resp = (
++    users_resp = (
+         supabase.table("users")
+         .select("*")
+         .eq("role", "EDITOR")
+-        .order("lifetime_points", desc=True)
+-        .limit(limit)
++        .limit(1000)
++        .execute()
++    )
++    users = users_resp.data or []
++
++    # Fetch active clips to sum OCV
++    clips_resp = (
++        supabase.table("clips")
++        .select("editor_id,ocv")
++        .eq("is_deleted", False)
++        .limit(10000)
+         .execute()
+     )
+-    users = resp.data if hasattr(resp, "data") else resp.get("data", [])
++    clips = clips_resp.data or []
++
++    editor_ocvs = {}
++    for c in clips:
++        eid = c.get("editor_id")
++        if eid:
++            editor_ocvs[eid] = editor_ocvs.get(eid, 0.0) + float(c.get("ocv") or 0.0)
++
++    standings = []
++    for u in users:
++        eid = u["user_id"]
++        ocv_val = editor_ocvs.get(eid, 0.0)
++        standings.append({
++            "editor": clean_doc(u),
++            "lifetime_points": u.get("lifetime_points", 0.0),
++            "lifetime_ocv": round(ocv_val, 2),
++            "total_earnings": u.get("total_earnings", 0.0),
++        })
++
++    # Sort standings by lifetime OCV descending
++    standings.sort(key=lambda x: x["lifetime_ocv"], reverse=True)
++
++    # Assign ranks and limit
+     out = []
+-    for i, u in enumerate(users, start=1):
+-        clips_resp = supabase.table("clips").select("ocv").eq("editor_id", u["user_id"]).execute()
+-        all_clips = clips_resp.data or []
+-        lifetime_ocv = sum(float(c.get("ocv") or 0.0) for c in all_clips)
+-        out.append(
+-            {
+-                "rank": i,
+-                "editor": clean_doc(u),
+-                "lifetime_points": u.get("lifetime_points", 0.0),
+-                "lifetime_ocv": round(lifetime_ocv, 2),
+-                "total_earnings": u.get("total_earnings", 0.0),
+-            }
+-        )
++    for i, entry in enumerate(standings[:limit], start=1):
++        entry["rank"] = i
++        out.append(entry)
+     return out
+ 
+ @api.get("/leaderboard/monthly")
+@@ -2295,6 +2699,7 @@ async def leaderboard_monthly(limit: int = 25):
+         supabase.table("clips")
+         .select("editor_id,points,submitted_at,ocv")
+         .gte("submitted_at", start.isoformat())
++        .eq("is_deleted", False)
+         .execute()
+     )
+     clips = clips_resp.data if hasattr(clips_resp, "data") else clips_resp.get("data", [])
+@@ -2308,8 +2713,8 @@ async def leaderboard_monthly(limit: int = 25):
+         stats["points"] += clip.get("points", 0.0)
+         stats["clips"] += 1
+         stats["ocv"] += float(clip.get("ocv") or 0.0)
+-    # Sort editors by points descending and respect the limit
+-    sorted_editors = sorted(editor_stats.items(), key=lambda x: x[1]["points"], reverse=True)[:limit]
++    # Sort editors by monthly OCV descending and respect the limit
++    sorted_editors = sorted(editor_stats.items(), key=lambda x: x[1]["ocv"], reverse=True)[:limit]
+     out = []
+     for i, (editor_id, stats) in enumerate(sorted_editors, start=1):
+         user_resp = (
+@@ -2357,15 +2762,9 @@ async def dashboard(request: Request,
+             .execute()
+         )
+         clips = clips_resp.data or []
+-        withdrawals_resp = (
+-            supabase.table("withdrawals")
+-            .select("*")
+-            .eq("user_id", user["user_id"])
+-            .order("created_at", desc=True)
+-            .limit(100)
+-            .execute()
+-        )
+-        withdrawals = withdrawals_resp.data or []
++        # Calculate paid and pending earnings dynamically
++        paid_earnings = sum(float(p.get("payout_amount") or 0.0) for p in parts if p.get("payout_status") == "PAID")
++        pending_earnings = sum(float(p.get("payout_amount") or 0.0) for p in parts if p.get("payout_status") == "AWAITING_PAYMENT")
+ 
+         camp_ids = [p["campaign_id"] for p in parts if p.get("campaign_id")]
+         campaigns_map = {}
+@@ -2379,31 +2778,47 @@ async def dashboard(request: Request,
+             )
+             campaigns_map = {c["campaign_id"]: c for c in (camps_resp.data or [])}
+ 
++        # Calculate lifetime ocv dynamically
++        all_user_clips_resp = (
++            supabase.table("clips")
++            .select("ocv")
++            .eq("editor_id", user["user_id"])
++            .eq("is_deleted", False)
++            .execute()
++        )
++        all_user_clips = all_user_clips_resp.data or []
++        lifetime_ocv = sum(float(c.get("ocv") or 0.0) for c in all_user_clips)
++
+         active_campaigns = []
+         for p in parts:
+             campaign = campaigns_map.get(p.get("campaign_id"))
+             if not campaign or campaign.get("status") != "ACTIVE":
+                 continue
+-            my_clips = len([c for c in clips if c.get("campaign_id") == campaign["campaign_id"]])
++            my_campaign_clips = [c for c in clips if c.get("campaign_id") == campaign["campaign_id"]]
++            my_clips = len(my_campaign_clips)
++            total_ocv = sum(float(c.get("ocv") or 0.0) for c in my_campaign_clips)
++
++            p_enriched = dict(p)
++            p_enriched["total_ocv"] = round(total_ocv, 2)
++
+             active_campaigns.append({
+                 "campaign": campaign,
+-                "participation": p,
++                "participation": p_enriched,
+                 "my_clips": my_clips,
+             })
+ 
+         return {
+             "role": "EDITOR",
+             "stats": {
+-                "wallet_balance": user["wallet_balance"],
+-                "total_earnings": user["total_earnings"],
+-                "total_withdrawn": user["total_withdrawn"],
+-                "total_points": round(float(user.get("lifetime_points") or 0.0), 2),
++                "paid_earnings": round(paid_earnings, 2),
++                "pending_earnings": round(pending_earnings, 2),
++                "lifetime_ocv": round(lifetime_ocv, 2),
+                 "campaigns_joined": len(parts),
+                 "current_rank": min([p.get("rank") for p in parts if p.get("rank")] or [0]),
+             },
+             "active_campaigns": active_campaigns,
+             "recent_clips": clips[:8],
+-            "withdrawal_requests": withdrawals,
++            "withdrawal_requests": [],
+             "my_campaigns": [],
+             "top_editors": []
+         }
+@@ -2423,6 +2838,7 @@ async def dashboard(request: Request,
+             supabase.table("clips")
+             .select("*")
+             .in_("campaign_id", camp_ids)
++            .eq("is_deleted", False)
+             .limit(5000)
+             .execute()
+         )
+@@ -2439,7 +2855,7 @@ async def dashboard(request: Request,
+             "campaigns_posted": len(camps),
+             "total_clips": len(clips),
+             "total_paid_out": round(total_paid_out, 2),
+-            "in_escrow": round(sum(float(c.get("bounty_pool") or 0.0) for c in camps if c.get("status") == "ACTIVE"), 2),
++            "in_escrow": round(sum(float(c.get("bounty_pool") or 0.0) for c in camps if c.get("status") in ("ACTIVE", "SETTLING")), 2),
+         },
+         "active_campaigns": [],
+         "recent_clips": [],
+@@ -2469,7 +2885,8 @@ async def get_user_profile(user_id: str):
+             supabase.table("clips")
+             .select("*")
+             .eq("editor_id", user_id)
+-            .order("points", desc=True)
++            .eq("is_deleted", False)
++            .order("ocv", desc=True)
+             .limit(12)
+             .execute()
+         )
+@@ -2491,6 +2908,7 @@ async def get_user_profile(user_id: str):
+             supabase.table("clips")
+             .select("ocv")
+             .eq("editor_id", user_id)
++            .eq("is_deleted", False)
+             .execute()
+         )
+         all_clips = all_clips_resp.data or []
+@@ -2730,7 +3148,205 @@ async def list_resources():
+          "read_minutes": 5, "tag": "INSTAGRAM"},
+     ]
+ 
++async def sync_clips_internal() -> dict:
++    """
++    Core business logic to find stale clips in ACTIVE campaigns,
++    refresh their metrics using batched YouTube API queries,
++    and recalculate points, OCV, campaign totals, and user lifetime points.
++    """
++    act_camps_resp = (
++        supabase.table("campaigns")
++        .select("campaign_id")
++        .eq("status", "ACTIVE")
++        .execute()
++    )
++    act_camps = act_camps_resp.data or []
++    if not act_camps:
++        return {"status": "success", "synced_clips_count": 0, "message": "No active campaigns found"}
++
++    camp_ids = [c["campaign_id"] for c in act_camps]
++
++    clips_resp = (
++        supabase.table("clips")
++        .select("*")
++        .in_("campaign_id", camp_ids)
++        .limit(10000)
++        .execute()
++    )
++    all_clips = clips_resp.data or []
++    if not all_clips:
++        return {"status": "success", "synced_clips_count": 0, "message": "No clips found in active campaigns"}
++
++    now = datetime.now(timezone.utc)
++    stale_clips = []
++
++    for clip in all_clips:
++        submitted_at_str = clip.get("submitted_at")
++        if not submitted_at_str:
++            continue
++        try:
++            submitted_at = datetime.fromisoformat(submitted_at_str.replace("Z", "+00:00"))
++        except Exception:
++            submitted_at = now
++
++        age = now - submitted_at
++        age_hours = age.total_seconds() / 3600.0
++
++        last_synced_at_str = clip.get("last_synced_at")
++        if not last_synced_at_str:
++            stale_clips.append(clip)
++            continue
++
++        try:
++            last_synced_at = datetime.fromisoformat(last_synced_at_str.replace("Z", "+00:00"))
++        except Exception:
++            stale_clips.append(clip)
++            continue
++
++        since_sync = now - last_synced_at
++        since_sync_hours = since_sync.total_seconds() / 3600.0
++
++        if age_hours < 24:
++            if since_sync_hours >= 1.0:
++                stale_clips.append(clip)
++        elif age_hours < 168:
++            if since_sync_hours >= 4.0:
++                stale_clips.append(clip)
++        else:
++            if since_sync_hours >= 12.0:
++                stale_clips.append(clip)
++
++    if not stale_clips:
++        return {"status": "success", "synced_clips_count": 0, "message": "All active clips are up to date"}
++
++    affected_campaigns = set()
++    affected_editors = set()
++    synced_clip_ids = []
++
++    for idx in range(0, len(stale_clips), 50):
++        batch = stale_clips[idx:idx+50]
++        video_ids = []
++        video_to_clip = {}
++        for c_doc in batch:
++            v_id = c_doc.get("video_id")
++            if v_id:
++                video_ids.append(v_id)
++                video_to_clip[v_id] = c_doc
++
++        if not video_ids:
++            for c_doc in batch:
++                supabase.table("clips").update({
++                    "last_synced_at": now.isoformat()
++                }).eq("clip_id", c_doc["clip_id"]).execute()
++            continue
++
++        stats_map, success = fetch_youtube_stats_batch(video_ids)
++        if not success:
++            logger.error(f"YouTube stats query failed for batch. Skipping updates to prevent accidental soft-deletions.")
++            continue
++
++        for c_doc in batch:
++            v_id = c_doc.get("video_id")
++            yt_data = stats_map.get(v_id)
++            if not yt_data:
++                supabase.table("clips").update({
++                    "last_synced_at": now.isoformat(),
++                    "is_deleted": True,
++                    "deleted_at": now.isoformat(),
++                    "ocv": 0.0,
++                    "points": 0.0
++                }).eq("clip_id", c_doc["clip_id"]).execute()
++                
++                synced_clip_ids.append(c_doc["clip_id"])
++                affected_campaigns.add(c_doc["campaign_id"])
++                affected_editors.add(c_doc["editor_id"])
++                continue
++
++            views = yt_data.get("views", 0)
++            likes = yt_data.get("likes", 0)
++            comments = yt_data.get("comments", 0)
++            published_at = yt_data.get("published_at")
++
++            engagement_pct = round((likes + comments) / views * 100.0, 2) if views > 0 else 0.0
++            retention_pct = 0.0
++
++            pts = calc_points(views, retention_pct, engagement_pct)
++            ocv_val = calculate_ocv(views, retention_pct, engagement_pct)
++
++            upd_data = {
++                "views": views,
++                "likes": likes,
++                "comments": comments,
++                "engagement_pct": engagement_pct,
++                "points": pts["points"],
++                "retention_mult": pts["retention_mult"],
++                "engagement_mult": pts["engagement_mult"],
++                "hit_mult": pts["hit_mult"],
++                "ocv": ocv_val,
++                "published_at": published_at,
++                "last_synced_at": now.isoformat(),
++                "yt_meta": yt_data
++            }
++
++            supabase.table("clips").update(upd_data).eq("clip_id", c_doc["clip_id"]).execute()
++            
++            synced_clip_ids.append(c_doc["clip_id"])
++            affected_campaigns.add(c_doc["campaign_id"])
++            affected_editors.add(c_doc["editor_id"])
++
++    for campaign_id in affected_campaigns:
++        await recompute_campaign(campaign_id)
++
++    for editor_id in affected_editors:
++        total_lifetime = 0.0
++        c_resp = (
++            supabase.table("clips")
++            .select("points")
++            .eq("editor_id", editor_id)
++            .eq("is_deleted", False)
++            .execute()
++        )
++        for cl in c_resp.data or []:
++            total_lifetime += cl.get("points", 0)
++        
++        supabase.table("users").update({
++            "lifetime_points": round(total_lifetime, 2)
++        }).eq("user_id", editor_id).execute()
++
++    return {
++        "status": "success",
++        "synced_clips_count": len(synced_clip_ids),
++        "synced_clip_ids": synced_clip_ids,
++        "affected_campaigns": list(affected_campaigns),
++        "affected_editors": list(affected_editors)
++    }
++
++@app.post("/internal/sync-clips")
++async def sync_clips_endpoint(
++    request: Request,
++    authorization: Optional[str] = Header(None),
++    x_internal_key: Optional[str] = Header(None)
++):
++    """Trigger periodic clip sync and metrics refresh."""
++    is_authorized = False
++    secret_key = os.environ.get("INTERNAL_SYNC_TOKEN")
++    
++    if secret_key and x_internal_key == secret_key:
++        is_authorized = True
++        
++    if not is_authorized:
++        try:
++            cookie_token = request.cookies.get("session_token")
++            user = await get_current_user(request, cookie_token, authorization)
++            await require_role(user, "ADMIN")
++            is_authorized = True
++        except Exception:
++            pass
++
++    if not is_authorized:
++        raise HTTPException(401, "Not authorized to trigger internal sync")
+ 
++    return await sync_clips_internal()
+ 
+ # ---------------- Mount ----------------
+ 

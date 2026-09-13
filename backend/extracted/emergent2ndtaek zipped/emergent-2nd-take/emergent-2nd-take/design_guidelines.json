@@ -1,0 +1,100 @@
+{
+  "theme": "Light Content with Dark Sidebar",
+  "archetype": "4 (Swiss & High-Contrast)",
+  "color_palette": {
+    "black": "#000000",
+    "electric_green": "#2CFF05",
+    "vivid_purple": "#BF00FF",
+    "dark_gray": "#2D2D2D",
+    "white": "#FFFFFF"
+  },
+  "color_tokens": {
+    "background_main": "#FFFFFF",
+    "background_sidebar": "#000000",
+    "text_primary_on_light": "#000000",
+    "text_secondary_on_light": "#2D2D2D",
+    "text_primary_on_dark": "#FFFFFF",
+    "text_secondary_on_dark": "#D1D5DB",
+    "accent_primary": "#2CFF05",
+    "accent_secondary": "#BF00FF",
+    "card_bg_light": "#FFFFFF",
+    "card_border_light": "#2D2D2D",
+    "card_bg_dark": "#2D2D2D"
+  },
+  "typography": {
+    "font_family_heading": "'Unbounded', sans-serif",
+    "font_family_body": "'IBM Plex Sans', sans-serif",
+    "font_family_mono": "'JetBrains Mono', monospace",
+    "heading_styles": {
+      "h1": "text-4xl sm:text-5xl lg:text-6xl font-black tracking-tighter text-black",
+      "h2": "text-2xl sm:text-3xl lg:text-4xl font-bold tracking-tight text-black",
+      "h3": "text-xl sm:text-2xl font-bold tracking-tight text-black"
+    },
+    "body_styles": {
+      "base": "text-base text-black",
+      "muted": "text-sm text-[#2D2D2D]"
+    }
+  },
+  "spacing_and_layout": {
+    "philosophy": "Generous spacing. Asymmetric layouts where appropriate. Sharp contrast.",
+    "sidebar": "w-64 flex-shrink-0 bg-black text-white h-screen sticky top-0 flex flex-col",
+    "content_area": "flex-1 bg-white min-h-screen p-6 md:p-10",
+    "grid_system": "Bento-style grids for dashboards. grid-cols-1 md:grid-cols-3 lg:grid-cols-4 gap-6."
+  },
+  "components": {
+    "buttons": {
+      "style": "Pill-shaped (rounded-full), generous horizontal padding (px-8 py-3). No subtle shadows.",
+      "primary": "bg-[#2CFF05] text-black font-bold hover:brightness-110 transition-all",
+      "secondary": "bg-[#BF00FF] text-white font-bold hover:brightness-110 transition-all",
+      "neutral": "bg-[#2D2D2D] text-white font-bold hover:bg-black transition-colors"
+    },
+    "cards": {
+      "style": "Solid block accents. 8px border-radius (rounded-lg) or sharp edges. No soft drop shadows, prefer hard 2px borders or offset solid shadows for a brutalist/Swiss feel.",
+      "stat_card_primary": "bg-[#2CFF05] text-black border-2 border-black p-6",
+      "stat_card_secondary": "bg-[#BF00FF] text-white border-2 border-black p-6",
+      "stat_card_neutral": "bg-white border-2 border-[#2D2D2D] text-black p-6",
+      "stat_card_dark": "bg-[#2D2D2D] text-white p-6"
+    },
+    "charts": {
+      "palette": ["#2CFF05", "#BF00FF", "#000000", "#2D2D2D"],
+      "style": "Solid colors, no gradients. Clean, thick lines or solid bars."
+    },
+    "navigation": {
+      "sidebar_links": "Duolingo-style. Large clickable areas, bold text, high contrast hover states (e.g., hover:bg-[#2D2D2D]). Active state: bg-[#2D2D2D] with #2CFF05 text or left border."
+    }
+  },
+  "pages": {
+    "auth_landing": "Hero the logo and 'Outperform. Climb. Earn.' value prop. Black background, massive Unbounded typography in white and green. Google OAuth button prominently displayed.",
+    "editor_dashboard": "White background. Top stats bar with varying card backgrounds (Green for Total Points, Purple for Earnings, Dark for Rank). Active Campaigns in a bold grid. Recent activity list.",
+    "creator_dashboard": "Similar layout. Campaign Performance charts using the mandated 4-color palette.",
+    "campaigns": "Gallery view with filter/sort chips (rounded-full bg-[#2D2D2D] text-white). Cards display bounty, deadline. Creation wizard uses a clean multi-step flow.",
+    "clip_submission": "Form with clear inputs, large tap targets, screenshot upload area with dashed border in #2D2D2D.",
+    "leaderboard": "Podium top-3 highlighting. Rank change arrows in #2CFF05. 'Your row' highlighted in #2CFF05 or #BF00FF.",
+    "resources": "Grid of content cards, thumbnails of video editing.",
+    "profile": "Public portfolio view. Asymmetric layout with large avatar, bold stats, and clip gallery."
+  },
+  "media": {
+    "logo": "https://customer-assets.emergentagent.com/job_724ad67e-8833-436d-b0f0-15cd54431290/artifacts/oko9uqmv_ChatGPT%20Image%20Jun%205%2C%202026%2C%2010_39_21%20AM.png",
+    "reference_ui": "https://customer-assets.emergentagent.com/job_724ad67e-8833-436d-b0f0-15cd54431290/artifacts/hvl71xsz_Screenshot%202026-06-05%20103242.png",
+    "avatars": [
+      "https://images.unsplash.com/photo-1562337404-3044c84ac061?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA3MDB8MHwxfHNlYXJjaHwyfHxzbWlsaW5nJTIwcG9ydHJhaXR8ZW58MHx8fHwxNzgwNjM2NjEzfDA&ixlib=rb-4.1.0&q=85",
+      "https://images.unsplash.com/photo-1580489944761-15a19d654956?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA3MDB8MHwxfHNlYXJjaHwxfHxzbWlsaW5nJTIwcG9ydHJhaXR8ZW58MHx8fHwxNzgwNjM2NjEzfDA&ixlib=rb-4.1.0&q=85"
+    ],
+    "campaign_thumbnails": [
+      "https://images.unsplash.com/photo-1614963326505-843868e1d83a?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1Mjh8MHwxfHNlYXJjaHw0fHx2aWRlbyUyMGVkaXRpbmclMjB0aW1lbGluZXxlbnwwfHx8fDE3ODA2MzY2MTN8MA&ixlib=rb-4.1.0&q=85",
+      "https://images.unsplash.com/photo-1626218174358-7769486c4b79?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA0MTJ8MHwxfHNlYXJjaHwzfHxnYW1pbmclMjBzdHJlYW1lciUyMHNldHVwfGVufDB8fHx8MTc4MDYzNjYxM3ww&ixlib=rb-4.1.0&q=85",
+      "https://images.pexels.com/photos/11553189/pexels-photo-11553189.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940"
+    ]
+  },
+  "instructions_to_main_agent": [
+    "CRITICAL: Do NOT use ANY colors outside of #000000, #2CFF05, #BF00FF, #2D2D2D, and #FFFFFF. This is a strict constraint.",
+    "Do NOT use gradients. Use solid block colors for backgrounds, buttons, and charts.",
+    "Install and configure 'Unbounded' (headings) and 'IBM Plex Sans' (body) fonts.",
+    "Sidebar MUST be black (#000000), content area MUST be white (#FFFFFF).",
+    "All interactive elements and key text MUST have a `data-testid` attribute (e.g., `data-testid=\"campaign-card-button\"`).",
+    "Use Shadcn UI components but heavily customize them to remove default soft shadows and gray borders. Apply solid #2D2D2D or black borders instead.",
+    "Follow a brutalist/Swiss high-contrast aesthetic. Tension and contrast are key.",
+    "Ensure contrast ratios are accessible, especially text on the #2CFF05 and #BF00FF backgrounds.",
+    "Use Phosphor Icons or Lucide icons for sharp, technical iconography."
+  ]
+}

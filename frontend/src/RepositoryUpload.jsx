@@ -1,10 +1,13 @@
 import { useState } from "react";
 import API from "./api";
+import FileTree from "./FileTree";
 
 function RepositoryUpload() {
     const [file, setFile] = useState(null);
     const [uploading, setUploading] = useState(false);
     const [message, setMessage] = useState("");
+    const [repository, setRepository] = useState(null);
+    const [repositoryFiles, setRepositoryFiles] = useState([]);
 
     const handleFileChange = (event) => {
         const selectedFile = event.target.files[0];
@@ -21,6 +24,8 @@ function RepositoryUpload() {
 
         setFile(selectedFile);
         setMessage("");
+        setRepository(null);
+        setRepositoryFiles([]);
     };
 
     const handleUpload = async () => {
@@ -35,6 +40,8 @@ function RepositoryUpload() {
         try {
             setUploading(true);
             setMessage("");
+            setRepository(null);
+            setRepositoryFiles([]);
 
             const response = await API.post(
                 "/api/repository/upload",
@@ -42,6 +49,8 @@ function RepositoryUpload() {
             );
 
             setMessage(response.data.message);
+            setRepository(response.data.repository);
+            setRepositoryFiles(response.data.files);
         } catch (error) {
             console.error("Upload failed:", error);
 
@@ -77,10 +86,30 @@ function RepositoryUpload() {
                 onClick={handleUpload}
                 disabled={uploading}
             >
-                {uploading ? "Uploading..." : "Upload Repository"}
+                {uploading ? "Analyzing..." : "Upload Repository"}
             </button>
 
             {message && <p>{message}</p>}
+
+            {repository && (
+                <div>
+
+
+                    <ul>
+                        {repository && (
+                            <div>
+                                <h2>Repository: {repository}</h2>
+
+                                <h3>
+                                    Files ({repositoryFiles.length})
+                                </h3>
+
+                                <FileTree files={repositoryFiles} />
+                            </div>
+                        )}
+                    </ul>
+                </div>
+            )}
         </div>
     );
 }

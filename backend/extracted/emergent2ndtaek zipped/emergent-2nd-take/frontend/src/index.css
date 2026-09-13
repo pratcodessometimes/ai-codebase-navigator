@@ -1,0 +1,105 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url('https://fonts.googleapis.com/css2?family=Unbounded:wght@400;600;700;800;900&family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap');
+
+:root {
+  --oc-black: #000000;
+  --oc-green: #2CFF05;
+  --oc-purple: #BF00FF;
+  --oc-gray: #2D2D2D;
+  --oc-white: #FFFFFF;
+
+  --background: 0 0% 100%;
+  --foreground: 0 0% 0%;
+  --card: 0 0% 100%;
+  --card-foreground: 0 0% 0%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 0 0% 0%;
+  --primary: 0 0% 0%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 0 0% 17%;
+  --secondary-foreground: 0 0% 100%;
+  --muted: 0 0% 96%;
+  --muted-foreground: 0 0% 18%;
+  --accent: 113 100% 51%;
+  --accent-foreground: 0 0% 0%;
+  --destructive: 0 84% 60%;
+  --destructive-foreground: 0 0% 100%;
+  --border: 0 0% 18%;
+  --input: 0 0% 18%;
+  --ring: 0 0% 0%;
+  --radius: 0.5rem;
+}
+
+* {
+  border-color: hsl(var(--border));
+}
+
+html, body, #root {
+  background: var(--oc-white);
+  color: var(--oc-black);
+  font-family: 'IBM Plex Sans', system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  margin: 0;
+}
+
+.font-display { font-family: 'Unbounded', sans-serif; letter-spacing: -0.02em; }
+.font-mono    { font-family: 'JetBrains Mono', monospace; }
+
+::selection { background: var(--oc-green); color: var(--oc-black); }
+
+/* Pill button base */
+.oc-btn { display: inline-flex; align-items: center; justify-content: center; gap: .5rem;
+  border-radius: 9999px; padding: .75rem 1.5rem; font-weight: 700; font-family: 'IBM Plex Sans'; letter-spacing: .01em;
+  transition: transform .15s ease, filter .15s ease, background .15s ease; cursor: pointer;
+  border: 2px solid transparent; user-select: none;
+}
+.oc-btn:hover { filter: brightness(1.08); transform: translateY(-1px); }
+.oc-btn:active { transform: translateY(0); }
+.oc-btn-primary { background: var(--oc-green); color: var(--oc-black); border-color: var(--oc-black); }
+.oc-btn-secondary { background: var(--oc-purple); color: var(--oc-white); border-color: var(--oc-black); }
+.oc-btn-dark { background: var(--oc-black); color: var(--oc-white); border-color: var(--oc-black); }
+.oc-btn-ghost { background: transparent; color: var(--oc-black); border-color: var(--oc-black); }
+.oc-btn-ghost:hover { background: var(--oc-black); color: var(--oc-white); }
+
+/* Card hard shadow swiss style */
+.oc-card { background: #fff; border: 2px solid var(--oc-black); border-radius: 14px; padding: 1.25rem; }
+.oc-card-offset { box-shadow: 6px 6px 0 0 var(--oc-black); }
+
+.oc-chip { display: inline-flex; align-items: center; gap: .35rem; padding: .25rem .75rem; border-radius: 9999px;
+  font-size: .75rem; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+
+/* hover lift on links */
+.oc-link { position: relative; }
+.oc-link::after { content: ''; position: absolute; left: 0; right: 0; bottom: -2px; height: 2px; background: var(--oc-green);
+  transform: scaleX(0); transform-origin: left; transition: transform .2s ease; }
+.oc-link:hover::after { transform: scaleX(1); }
+
+/* scrollbar */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: var(--oc-black); border-radius: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* sidebar active */
+.oc-sidebar-link { display: flex; align-items: center; gap: .85rem; padding: .85rem 1.1rem; border-radius: 12px;
+  color: #d1d5db; font-weight: 600; transition: background .15s, color .15s; cursor: pointer; }
+.oc-sidebar-link:hover { background: var(--oc-gray); color: #fff; }
+.oc-sidebar-link.active { background: var(--oc-gray); color: var(--oc-green); border-left: 3px solid var(--oc-green); padding-left: calc(1.1rem - 3px); }
+
+/* podium */
+.oc-podium { background: var(--oc-green); color: var(--oc-black); }
+.oc-podium-2 { background: var(--oc-purple); color: var(--oc-white); }
+.oc-podium-3 { background: var(--oc-gray); color: var(--oc-white); }
+
+/* loading dot */
+@keyframes pulse-dot { 0%,100%{opacity:.3} 50%{opacity:1} }
+.oc-pulse { animation: pulse-dot 1.2s ease-in-out infinite; }
+
+/* tabs */
+.oc-tab { padding: .6rem 1.1rem; border-radius: 9999px; font-weight: 700; cursor: pointer; border: 2px solid var(--oc-black); background: #fff; color: var(--oc-black); font-size: .85rem; }
+.oc-tab.active { background: var(--oc-black); color: #fff; }
+.oc-tab.green.active { background: var(--oc-green); color: var(--oc-black); }
+.oc-tab.purple.active { background: var(--oc-purple); color: #fff; }
